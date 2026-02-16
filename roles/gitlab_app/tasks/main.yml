@@ -60,6 +60,7 @@
     update_cache: true
   environment:
     GITLAB_SKIP_RECONFIGURE: "true"
+  notify: Reconfigure gitlab
 
 # ============================================================
 # PostgreSQL — GitLab Database Preparation

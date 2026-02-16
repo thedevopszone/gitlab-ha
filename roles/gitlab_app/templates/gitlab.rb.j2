@@ -77,7 +77,6 @@ gitlab_rails['auto_migrate'] = false
 # Redis — external Sentinel-managed cluster
 # ============================================================
 redis['master_name'] = '{{ redis_sentinel_master_name }}'
-redis['master_password'] = ''
 gitlab_rails['redis_sentinels'] = [
 {% for host in groups['redis_cluster'] %}
   { 'host' => '{{ hostvars[host]["ansible_host"] }}', 'port' => {{ redis_sentinel_port }} },
