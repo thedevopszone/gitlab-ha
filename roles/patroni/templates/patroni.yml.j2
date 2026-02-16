@@ -35,6 +35,7 @@ bootstrap:
     - local all all trust
     - host all all 127.0.0.1/32 trust
     - host all all {{ postgresql_network_cidr }} md5
+    - host replication {{ postgresql_replication_user }} 127.0.0.1/32 md5
 {% for host in groups['postgres_cluster'] %}
     - host replication {{ postgresql_replication_user }} {{ hostvars[host]['ansible_host'] }}/32 md5
 {% endfor %}
@@ -73,6 +74,7 @@ postgresql:
     - local all all trust
     - host all all 127.0.0.1/32 trust
     - host all all {{ postgresql_network_cidr }} md5
+    - host replication {{ postgresql_replication_user }} 127.0.0.1/32 md5
 {% for host in groups['postgres_cluster'] %}
     - host replication {{ postgresql_replication_user }} {{ hostvars[host]['ansible_host'] }}/32 md5
 {% endfor %}
