@@ -4,7 +4,7 @@
 
 # Omnibus
 gitlab_omnibus_package: gitlab-ce
-gitlab_external_url: "https://gitlab.example.local"
+gitlab_external_url: "http://gitlab.example.local"
 
 # PostgreSQL (external)
 gitlab_db_host: "{{ hostvars[groups['postgres_cluster'][0]]['ansible_host'] }}"

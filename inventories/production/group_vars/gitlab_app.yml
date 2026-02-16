@@ -6,7 +6,7 @@
 # GitLab Omnibus
 # ============================================================
 gitlab_omnibus_package: gitlab-ce
-gitlab_external_url: "https://gitlab.example.local"
+gitlab_external_url: "http://gitlab.example.local"
 
 # ============================================================
 # PostgreSQL (external — managed by Patroni)
