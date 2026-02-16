@@ -1550,7 +1550,7 @@ ansible-playbook playbooks/praefect.yml --ask-vault-pass
 | Setting                  | Value                                    |
 |--------------------------|------------------------------------------|
 | GitLab Omnibus version   | GitLab CE (Community Edition)            |
-| External URL             | `https://gitlab.example.local`           |
+| External URL             | `http://gitlab.example.local`            |
 | Workhorse port           | `8181` (TCP, for external load balancer) |
 | Puma port                | `8080` (localhost only)                  |
 | Puma workers             | `4`                                      |
@@ -1648,7 +1648,7 @@ curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8181/users/sign_in
 # Expected: 200
 
 # Via external load balancer
-curl -k https://gitlab.example.local/users/sign_in
+curl http://gitlab.example.local/users/sign_in
 ```
 
 #### GitLab Rake checks
@@ -1702,7 +1702,7 @@ ssh gl-prd-app-01 'sudo gitlab-ctl tail'
 
    | Variable                       | Default                      | Description                              |
    |--------------------------------|------------------------------|------------------------------------------|
-   | `gitlab_external_url`          | `https://gitlab.example.local`| External URL (affects generated links)  |
+   | `gitlab_external_url`          | `http://gitlab.example.local` | External URL (affects generated links)  |
    | `gitlab_db_host`               | *(first postgres node)*      | Database host (use VIP in production)    |
    | `gitlab_db_password`           | `changeme-gitlab-db`         | Database password (use vault)            |
    | `redis_sentinel_master_name`   | `mymaster`                   | Redis Sentinel master name               |
