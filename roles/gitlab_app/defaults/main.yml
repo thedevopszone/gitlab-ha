@@ -3,7 +3,7 @@
 # Override in group_vars/gitlab_app.yml or inventory for production.
 
 # Omnibus
-gitlab_omnibus_package: gitlab-ee
+gitlab_omnibus_package: gitlab-ce
 gitlab_external_url: "https://gitlab.example.local"
 
 # PostgreSQL (external)

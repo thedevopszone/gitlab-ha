@@ -52,6 +52,31 @@
 # ============================================================
 # GitLab Omnibus Package
 # ============================================================
+# Handle edition swap (e.g. EE → CE).  The conflicting package
+# must be removed first; apt remove preserves /etc/gitlab/.
+
+- name: Determine conflicting GitLab package
+  ansible.builtin.set_fact:
+    _gitlab_conflicting_package: "{{ 'gitlab-ee' if gitlab_omnibus_package == 'gitlab-ce' else 'gitlab-ce' }}"
+
+- name: Check if conflicting GitLab package is installed
+  ansible.builtin.command:
+    cmd: dpkg-query -W -f='${Status}' {{ _gitlab_conflicting_package }}
+  register: _conflicting_pkg
+  changed_when: false
+  failed_when: false
+
+- name: Remove conflicting GitLab package ({{ _gitlab_conflicting_package }})
+  ansible.builtin.apt:
+    name: "{{ _gitlab_conflicting_package }}"
+    state: absent
+  when: "'install ok installed' in (_conflicting_pkg.stdout | default(''))"
+
+- name: Clear stale cookbook cache after edition swap
+  ansible.builtin.file:
+    path: /opt/gitlab/embedded/cookbooks/cache
+    state: absent
+  when: "'install ok installed' in (_conflicting_pkg.stdout | default(''))"
 
 - name: Ensure GitLab Omnibus package is installed
   ansible.builtin.apt:
