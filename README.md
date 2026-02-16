@@ -90,7 +90,8 @@ gitlab-ha/
     ├── redis.yml
     ├── gitaly.yml
     ├── praefect.yml
-    └── gitlab_app.yml
+    ├── gitlab_app.yml
+    └── load_test.yml          # HTTP load testing utility
 ```
 
 ## Deployment Order
@@ -1865,3 +1866,43 @@ ansible-playbook playbooks/gitlab_app.yml --ask-vault-pass
 | `gitlab-ctl reconfigure` fails with "Removed configurations found" | Using deprecated settings in `gitlab.rb` | Check for `git_data_dirs()` (removed in 18.0), `grafana['enable']` (removed); update template |
 | Sessions not shared between nodes | Different `secret_key_base` on each node | Verify `/etc/gitlab/gitlab-secrets.json` is identical on both nodes; re-run the playbook |
 | Gitaly connection errors | Praefect auth token mismatch or Praefect unreachable | Verify `praefect_auth_token` matches the Praefect cluster; check port 2305 connectivity to Praefect nodes |
+
+---
+
+## Load Testing
+
+A utility playbook for measuring how many concurrent users the GitLab deployment can handle. Uses Apache Bench (`ab`) from `apache2-utils`, running from the first app node against `localhost:8181` to avoid network bottlenecks skewing results.
+
+### Running a Load Test
+
+```bash
+# Default test (10 → 200 concurrent users, 1000 requests per level)
+ansible-playbook playbooks/load_test.yml
+
+# Custom concurrency levels and request count
+ansible-playbook playbooks/load_test.yml \
+  -e '{"load_test_total_requests": 2000, "load_test_concurrency_levels": [50, 100, 200, 300]}'
+
+# Test a specific endpoint
+ansible-playbook playbooks/load_test.yml \
+  -e 'load_test_url=http://127.0.0.1:8181/api/v4/projects'
+```
+
+### Variables
+
+| Variable                       | Default                                    | Description                              |
+|--------------------------------|--------------------------------------------|------------------------------------------|
+| `load_test_url`                | `http://127.0.0.1:8181/users/sign_in`      | Endpoint to test                         |
+| `load_test_total_requests`     | `1000`                                     | Total requests per concurrency level     |
+| `load_test_concurrency_levels` | `[10, 25, 50, 100, 150, 200]`              | List of concurrency levels to test       |
+| `load_test_timeout`            | `30`                                       | Timeout in seconds per request           |
+
+### Reading the Results
+
+The playbook outputs a summary table showing for each concurrency level:
+
+- **Req/sec** — throughput (higher is better)
+- **Mean / P95 / P99 latency** — response times in milliseconds
+- **Failed / Non-2xx** — error counts
+
+The **threshold** line identifies the concurrency level where errors first appear, which represents the practical concurrent user limit for the deployment.

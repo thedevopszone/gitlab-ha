@@ -1,0 +1,189 @@
+---
+# playbooks/load_test.yml
+#
+# HTTP load test for GitLab application nodes using Apache Bench (ab).
+# Runs from the first app node against localhost:8181 to measure
+# how many concurrent users the setup can handle.
+#
+# Usage:
+#   ansible-playbook playbooks/load_test.yml
+#
+#   # Custom concurrency levels and request count
+#   ansible-playbook playbooks/load_test.yml \
+#     -e '{"load_test_total_requests": 2000, "load_test_concurrency_levels": [50, 100, 200, 300]}'
+#
+#   # Test a specific endpoint
+#   ansible-playbook playbooks/load_test.yml \
+#     -e 'load_test_url=http://127.0.0.1:8181/api/v4/projects'
+
+- name: GitLab HTTP Load Test
+  hosts: gitlab_app
+  become: true
+  run_once: true
+  gather_facts: false
+
+  vars:
+    load_test_url: "http://127.0.0.1:8181/users/sign_in"
+    load_test_total_requests: 1000
+    load_test_concurrency_levels:
+      - 10
+      - 25
+      - 50
+      - 100
+      - 150
+      - 200
+    load_test_timeout: 30
+
+  tasks:
+    - name: Install apache2-utils (provides ab)
+      ansible.builtin.apt:
+        name: apache2-utils
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Verify GitLab is responding before load test
+      ansible.builtin.uri:
+        url: "{{ load_test_url }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: _preflight
+      retries: 3
+      delay: 5
+
+    - name: Display load test parameters
+      ansible.builtin.debug:
+        msg: |
+          === GitLab Load Test Configuration ===
+          URL:                {{ load_test_url }}
+          Total requests:     {{ load_test_total_requests }} per level
+          Concurrency levels: {{ load_test_concurrency_levels | join(', ') }}
+          Timeout per req:    {{ load_test_timeout }}s
+
+    - name: Run ab for each concurrency level
+      ansible.builtin.command:
+        cmd: >-
+          ab
+          -n {{ load_test_total_requests }}
+          -c {{ item }}
+          -s {{ load_test_timeout }}
+          {{ load_test_url }}
+      loop: "{{ load_test_concurrency_levels }}"
+      loop_control:
+        label: "c={{ item }}"
+      register: _ab_results
+      changed_when: false
+      failed_when: _ab_results.rc != 0 and 'apr_socket_recv' not in _ab_results.stderr
+
+    - name: Parse ab results
+      ansible.builtin.set_fact:
+        _parsed_results: >-
+          {{
+            _parsed_results | default([]) + [{
+              'concurrency': item.item,
+              'rps': (item.stdout | regex_search('Requests per second:\s+([\d.]+)', '\1') | default(['N/A'], true))[0],
+              'mean_ms': (item.stdout | regex_search('Time per request:\s+([\d.]+) \[ms\] \(mean\)', '\1') | default(['N/A'], true))[0],
+              'p50_ms': (item.stdout | regex_search('  50%\s+(\d+)', '\1') | default(['N/A'], true))[0],
+              'p90_ms': (item.stdout | regex_search('  90%\s+(\d+)', '\1') | default(['N/A'], true))[0],
+              'p95_ms': (item.stdout | regex_search('  95%\s+(\d+)', '\1') | default(['N/A'], true))[0],
+              'p99_ms': (item.stdout | regex_search('  99%\s+(\d+)', '\1') | default(['N/A'], true))[0],
+              'failed': (item.stdout | regex_search('Failed requests:\s+(\d+)', '\1') | default(['0'], true))[0],
+              'non_2xx': (item.stdout | regex_search('Non-2xx responses:\s+(\d+)', '\1') | default(['0'], true))[0],
+              'total_time': (item.stdout | regex_search('Time taken for tests:\s+([\d.]+)', '\1') | default(['N/A'], true))[0],
+              'complete': (item.stdout | regex_search('Complete requests:\s+(\d+)', '\1') | default(['N/A'], true))[0]
+            }]
+          }}
+      loop: "{{ _ab_results.results }}"
+      loop_control:
+        label: "c={{ item.item }}"
+
+    - name: Display results per concurrency level
+      ansible.builtin.debug:
+        msg: |
+          {% for r in _parsed_results %}
+          --- Concurrency: {{ r.concurrency }} ---
+            Requests/sec:    {{ r.rps }}
+            Mean latency:    {{ r.mean_ms }} ms
+            P50 latency:     {{ r.p50_ms }} ms
+            P90 latency:     {{ r.p90_ms }} ms
+            P95 latency:     {{ r.p95_ms }} ms
+            P99 latency:     {{ r.p99_ms }} ms
+            Failed requests: {{ r.failed }}
+            Non-2xx resp:    {{ r.non_2xx }}
+            Completed:       {{ r.complete }} / {{ load_test_total_requests }}
+            Total time:      {{ r.total_time }}s
+          {% endfor %}
+
+    - name: Display summary table
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════╦════════════╦═══════════╦═══════════╦═══════════╦══════════╦══════════╗
+          ║ Concurrency║ Req/sec   ║ Mean (ms) ║ P95 (ms)  ║ P99 (ms)  ║ Failed   ║ Non-2xx  ║
+          ╠════════════╬════════════╬═══════════╬═══════════╬═══════════╬══════════╬══════════╣
+          {% for r in _parsed_results %}
+          ║ {{ "%-10s" | format(r.concurrency) }} ║ {{ "%-10s" | format(r.rps) }} ║ {{ "%-9s" | format(r.mean_ms) }} ║ {{ "%-9s" | format(r.p95_ms) }} ║ {{ "%-9s" | format(r.p99_ms) }} ║ {{ "%-8s" | format(r.failed) }} ║ {{ "%-8s" | format(r.non_2xx) }} ║
+          {% endfor %}
+          ╚════════════╩════════════╩═══════════╩═══════════╩═══════════╩══════════╩══════════╝
+
+          {% set ns = namespace(threshold='No errors detected') %}
+          {% for r in _parsed_results %}
+          {%   if (r.failed | int > 0 or r.non_2xx | int > 0) and ns.threshold == 'No errors detected' %}
+          {%     set ns.threshold = 'Errors start at concurrency ' ~ r.concurrency ~ ' (' ~ r.failed ~ ' failed, ' ~ r.non_2xx ~ ' non-2xx)' %}
+          {%   endif %}
+          {% endfor %}
+
+          >> Threshold: {{ ns.threshold }}
+          >> Practical concurrent user limit: {% if ns.threshold == 'No errors detected' %}{{ _parsed_results[-1].concurrency }}+ (all levels passed){% else %}{{ ns.threshold }}{% endif %}
+
+    - name: Compute capacity estimate
+      ansible.builtin.set_fact:
+        _avg_rps: "{{ (_parsed_results | map(attribute='rps') | map('float') | list | sum / _parsed_results | length) | round(1) }}"
+        _app_node_count: "{{ groups['gitlab_app'] | length }}"
+        _comfortable_concurrency: >-
+          {% set ns = namespace(val=_parsed_results[-1].concurrency) %}
+          {% for r in _parsed_results %}
+          {%   if r.p95_ms | int <= 1000 %}
+          {%     set ns.val = r.concurrency %}
+          {%   endif %}
+          {% endfor %}
+          {{ ns.val }}
+        _acceptable_concurrency: >-
+          {% set ns = namespace(val=_parsed_results[-1].concurrency) %}
+          {% for r in _parsed_results %}
+          {%   if r.p95_ms | int <= 3000 %}
+          {%     set ns.val = r.concurrency %}
+          {%   endif %}
+          {% endfor %}
+          {{ ns.val }}
+
+    - name: Display capacity estimate
+      ansible.builtin.debug:
+        msg: |
+          ====================================================================
+                        CAPACITY ESTIMATE — GitLab HA Cluster
+          ====================================================================
+
+          Single-node throughput:  {{ _avg_rps }} req/sec (average across all levels)
+          App nodes in cluster:   {{ _app_node_count }}
+          Cluster throughput:     ~{{ (_avg_rps | float * _app_node_count | int) | round(0) | int }} req/sec (with load balancer)
+
+          ── Concurrent Request Limits (per node → cluster total) ──────────
+
+            Comfortable (P95 < 1s):   {{ _comfortable_concurrency | trim }} concurrent requests per node → ~{{ _comfortable_concurrency | trim | int * _app_node_count | int }} cluster-wide
+            Acceptable  (P95 < 3s):   {{ _acceptable_concurrency | trim }} concurrent requests per node → ~{{ _acceptable_concurrency | trim | int * _app_node_count | int }} cluster-wide
+            Maximum tested:           {{ _parsed_results[-1].concurrency }} concurrent requests per node → ~{{ _parsed_results[-1].concurrency | int * _app_node_count | int }} cluster-wide
+
+          ── Estimated Logged-in Users (10:1 idle ratio) ───────────────────
+
+            Comfortable experience:   ~{{ _comfortable_concurrency | trim | int * _app_node_count | int * 10 }} users
+            Acceptable experience:    ~{{ _acceptable_concurrency | trim | int * _app_node_count | int * 10 }} users
+            Degraded (but working):   ~{{ _parsed_results[-1].concurrency | int * _app_node_count | int * 10 }} users
+
+          ── How to increase capacity ──────────────────────────────────────
+
+            - Increase Puma workers    (puma_worker_processes, currently in group_vars)
+            - Increase Puma threads    (puma_min/max_threads)
+            - Add more app nodes       (stateless — just add to gitlab_app group)
+
+          ====================================================================
