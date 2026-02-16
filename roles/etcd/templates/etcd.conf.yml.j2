@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# etcd configuration for {{ etcd_member_name }}
+
+name: '{{ etcd_member_name }}'
+data-dir: '{{ etcd_data_dir }}'
+
+listen-peer-urls: 'http://{{ ansible_host }}:{{ etcd_peer_port }}'
+listen-client-urls: 'http://{{ ansible_host }}:{{ etcd_client_port }},http://127.0.0.1:{{ etcd_client_port }}'
+
+initial-advertise-peer-urls: 'http://{{ ansible_host }}:{{ etcd_peer_port }}'
+advertise-client-urls: 'http://{{ ansible_host }}:{{ etcd_client_port }}'
+
+initial-cluster: '{{ groups["etcd_cluster"] | map("extract", hostvars, ["etcd_member_name"]) | zip(groups["etcd_cluster"] | map("extract", hostvars, ["ansible_host"]) | map("regex_replace", "$", ":" ~ etcd_peer_port) | map("regex_replace", "^", "http://")) | map("join", "=") | join(",") }}'
+initial-cluster-state: '{{ etcd_initial_cluster_state }}'
+initial-cluster-token: '{{ etcd_cluster_name }}'
