@@ -19,6 +19,7 @@ bootstrap:
       use_pg_rewind: true
       use_slots: true
       parameters:
+        max_connections: {{ postgresql_max_connections }}
         wal_level: replica
         hot_standby: "on"
         max_wal_senders: {{ postgresql_max_wal_senders }}
@@ -62,6 +63,7 @@ postgresql:
       password: "{{ postgresql_replication_password }}"
   parameters:
     unix_socket_directories: /var/run/postgresql
+    max_connections: {{ postgresql_max_connections }}
     shared_buffers: {{ postgresql_shared_buffers }}
     wal_level: replica
     hot_standby: "on"

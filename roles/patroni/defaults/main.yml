@@ -16,6 +16,7 @@ postgresql_replication_user: replicator
 postgresql_replication_password: "changeme-repl"
 
 # PostgreSQL tuning
+postgresql_max_connections: 300
 postgresql_shared_buffers: "256MB"
 postgresql_max_wal_senders: 5
 postgresql_max_replication_slots: 5

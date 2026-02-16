@@ -11,6 +11,7 @@ postgresql_superuser_password: "changeme-super"
 postgresql_replication_password: "changeme-repl"
 
 # Tuning
+postgresql_max_connections: 300
 postgresql_shared_buffers: "256MB"
 postgresql_max_wal_senders: 5
 postgresql_max_replication_slots: 5
