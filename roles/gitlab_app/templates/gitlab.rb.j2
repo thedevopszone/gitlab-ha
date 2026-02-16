@@ -1,0 +1,110 @@
+# {{ ansible_managed }}
+# GitLab Application Node — {{ inventory_hostname }} ({{ ansible_host }})
+#
+# Stateless Rails application node connecting to external:
+#   - PostgreSQL (Patroni-managed cluster)
+#   - Redis (Sentinel-managed cluster)
+#   - Gitaly (Praefect-managed cluster)
+#
+# Managed by Ansible — do not edit manually.
+# Compatible with GitLab 18.x.
+
+# ============================================================
+# External URL
+# ============================================================
+external_url '{{ gitlab_external_url }}'
+
+# ============================================================
+# Service Selection — disable all local data services
+# ============================================================
+postgresql['enable'] = false
+redis['enable'] = false
+gitaly['enable'] = false
+praefect['enable'] = false
+
+# Disable services not needed on app nodes
+nginx['enable'] = false
+prometheus['enable'] = false
+alertmanager['enable'] = false
+gitlab_kas['enable'] = false
+gitlab_pages['enable'] = false
+registry['enable'] = false
+letsencrypt['enable'] = false
+
+# ============================================================
+# Enable application services
+# ============================================================
+puma['enable'] = true
+sidekiq['enable'] = true
+gitlab_workhorse['enable'] = true
+gitlab_exporter['enable'] = true
+
+# ============================================================
+# Workhorse — TCP listener for external load balancer
+# ============================================================
+# No local NGINX; the external LB terminates TLS and proxies
+# to Workhorse on port {{ gitlab_workhorse_port }}.
+gitlab_workhorse['listen_network'] = 'tcp'
+gitlab_workhorse['listen_addr'] = '{{ gitlab_workhorse_listen_addr }}:{{ gitlab_workhorse_port }}'
+
+# ============================================================
+# Puma (Rails application server)
+# ============================================================
+puma['listen'] = '127.0.0.1'
+puma['port'] = 8080
+puma['worker_processes'] = {{ puma_worker_processes }}
+puma['min_threads'] = {{ puma_min_threads }}
+puma['max_threads'] = {{ puma_max_threads }}
+
+# ============================================================
+# Sidekiq
+# ============================================================
+sidekiq['concurrency'] = {{ sidekiq_concurrency }}
+
+# ============================================================
+# PostgreSQL — external Patroni-managed cluster
+# ============================================================
+gitlab_rails['db_adapter'] = 'postgresql'
+gitlab_rails['db_encoding'] = 'unicode'
+gitlab_rails['db_host'] = '{{ gitlab_db_host }}'
+gitlab_rails['db_port'] = {{ gitlab_db_port }}
+gitlab_rails['db_username'] = '{{ gitlab_db_username }}'
+gitlab_rails['db_password'] = '{{ gitlab_db_password }}'
+gitlab_rails['db_database'] = '{{ gitlab_db_name }}'
+gitlab_rails['auto_migrate'] = false
+
+# ============================================================
+# Redis — external Sentinel-managed cluster
+# ============================================================
+redis['master_name'] = '{{ redis_sentinel_master_name }}'
+redis['master_password'] = ''
+gitlab_rails['redis_sentinels'] = [
+{% for host in groups['redis_cluster'] %}
+  { 'host' => '{{ hostvars[host]["ansible_host"] }}', 'port' => {{ redis_sentinel_port }} },
+{% endfor %}
+]
+
+# ============================================================
+# Gitaly — external Praefect-managed cluster
+# ============================================================
+# The gitaly_token authenticates Rails ↔ Praefect communication.
+# The repositories_storages entry must match the virtual storage
+# name configured in the Praefect cluster ("{{ praefect_virtual_storage_name }}").
+#
+# NOTE: In production, replace the gitaly_address with a TCP
+# load-balancer VIP in front of the Praefect cluster.
+gitlab_rails['gitaly_token'] = '{{ praefect_auth_token }}'
+gitlab_rails['repositories_storages'] = {
+  '{{ praefect_virtual_storage_name }}' => {
+    'gitaly_address' => 'tcp://{{ hostvars[groups["praefect_cluster"][0]]["ansible_host"] }}:{{ praefect_port }}',
+  },
+}
+
+# ============================================================
+# Logging
+# ============================================================
+logging['logrotate_frequency'] = 'daily'
+logging['logrotate_maxsize'] = nil
+logging['logrotate_rotate'] = 30
+logging['logrotate_compress'] = 'compress'
+logging['logrotate_delaycompress'] = 'delaycompress'

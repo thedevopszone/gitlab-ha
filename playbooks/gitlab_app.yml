@@ -1,0 +1,6 @@
+---
+- name: Deploy GitLab Application Layer
+  hosts: gitlab_app
+  become: true
+  roles:
+    - gitlab_app

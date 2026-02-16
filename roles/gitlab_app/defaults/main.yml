@@ -1,0 +1,38 @@
+---
+# GitLab Application role defaults
+# Override in group_vars/gitlab_app.yml or inventory for production.
+
+# Omnibus
+gitlab_omnibus_package: gitlab-ee
+gitlab_external_url: "https://gitlab.example.local"
+
+# PostgreSQL (external)
+gitlab_db_host: "{{ hostvars[groups['postgres_cluster'][0]]['ansible_host'] }}"
+gitlab_db_port: 5432
+gitlab_db_name: gitlabhq_production
+gitlab_db_username: gitlab
+gitlab_db_password: "changeme-gitlab-db"
+
+# Redis Sentinel (external)
+redis_sentinel_port: 26379
+redis_sentinel_master_name: mymaster
+
+# Praefect (external)
+praefect_port: 2305
+praefect_virtual_storage_name: default
+praefect_auth_token: "changeme-praefect-secret"
+
+# Puma
+puma_worker_processes: 4
+puma_min_threads: 4
+puma_max_threads: 4
+
+# Sidekiq
+sidekiq_concurrency: 20
+
+# Workhorse
+gitlab_workhorse_listen_addr: "0.0.0.0"
+gitlab_workhorse_port: 8181
+
+# Patroni REST API
+patroni_rest_api_port: 8008

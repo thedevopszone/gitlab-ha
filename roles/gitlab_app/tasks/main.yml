@@ -1,0 +1,311 @@
+---
+# ============================================================
+# GitLab Omnibus APT Repository
+# ============================================================
+
+- name: Install prerequisites for GitLab repository
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg
+      - apt-transport-https
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Add GitLab APT signing key
+  ansible.builtin.apt_key:
+    url: "https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/gpgkey"
+    state: present
+
+- name: Add GitLab APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/ubuntu/ {{ ansible_distribution_release }} main"
+    state: present
+    filename: gitlab-{{ gitlab_omnibus_package }}
+
+# ============================================================
+# Pre-deployment Configuration
+# ============================================================
+# Deploy gitlab.rb BEFORE the package install so that the
+# Omnibus postinst reconfigure uses our configuration (external
+# services, auto_migrate=false) instead of the default which
+# would start local PostgreSQL, Redis, etc.
+
+- name: Ensure /etc/gitlab directory exists
+  ansible.builtin.file:
+    path: /etc/gitlab
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy gitlab.rb for application node
+  ansible.builtin.template:
+    src: gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Reconfigure gitlab
+
+# ============================================================
+# GitLab Omnibus Package
+# ============================================================
+
+- name: Ensure GitLab Omnibus package is installed
+  ansible.builtin.apt:
+    name: "{{ gitlab_omnibus_package }}"
+    state: present
+    update_cache: true
+  environment:
+    GITLAB_SKIP_RECONFIGURE: "true"
+
+# ============================================================
+# PostgreSQL — GitLab Database Preparation
+# ============================================================
+# Discover the Patroni primary via REST API, then create the
+# database, user, and required extensions.  All database tasks
+# delegate to the primary and run once.
+
+- name: Query Patroni nodes to find primary
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[item]['ansible_host'] }}:{{ patroni_rest_api_port }}/primary"
+    status_code:
+      - 200
+      - 503
+    timeout: 5
+  loop: "{{ groups['postgres_cluster'] }}"
+  register: _patroni_primary_check
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: Identify Patroni primary node
+  ansible.builtin.set_fact:
+    _patroni_primary: >-
+      {{ (_patroni_primary_check.results
+          | selectattr('status', 'defined')
+          | selectattr('status', 'equalto', 200)
+          | map(attribute='item')
+          | first) }}
+  run_once: true
+
+- name: Display discovered Patroni primary
+  ansible.builtin.debug:
+    msg: "Patroni primary: {{ _patroni_primary }} ({{ hostvars[_patroni_primary]['ansible_host'] }})"
+  run_once: true
+
+- name: Check if GitLab database user exists
+  ansible.builtin.command:
+    cmd: psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ gitlab_db_username }}'"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  register: _gitlab_user_exists
+  changed_when: false
+
+- name: Create GitLab database user
+  ansible.builtin.command:
+    cmd: psql -c "CREATE ROLE {{ gitlab_db_username }} WITH LOGIN CREATEDB PASSWORD '{{ gitlab_db_password }}';"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  when: _gitlab_user_exists.stdout | trim != "1"
+
+- name: Check if GitLab database exists
+  ansible.builtin.command:
+    cmd: psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ gitlab_db_name }}'"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  register: _gitlab_db_exists
+  changed_when: false
+
+- name: Create GitLab database
+  ansible.builtin.command:
+    cmd: createdb -O {{ gitlab_db_username }} {{ gitlab_db_name }}
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  when: _gitlab_db_exists.stdout | trim != "1"
+
+- name: Grant privileges on GitLab database
+  ansible.builtin.command:
+    cmd: psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ gitlab_db_name }} TO {{ gitlab_db_username }};"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  changed_when: false
+
+# PostgreSQL extensions required by GitLab
+- name: Ensure pg_trgm extension exists
+  ansible.builtin.command:
+    cmd: psql -d {{ gitlab_db_name }} -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  changed_when: false
+
+- name: Ensure btree_gist extension exists
+  ansible.builtin.command:
+    cmd: psql -d {{ gitlab_db_name }} -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  changed_when: false
+
+- name: Ensure pgcrypto extension exists
+  ansible.builtin.command:
+    cmd: psql -d {{ gitlab_db_name }} -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  changed_when: false
+
+# ============================================================
+# Shared Secrets Management
+# ============================================================
+# GitLab secrets (secret_key_base, db_key_base, otp_key_base,
+# etc.) MUST be identical across all app nodes.  Strategy:
+#   1. Check if secrets exist on the primary app node
+#   2. If not, run reconfigure once to generate them
+#   3. Fetch from primary and distribute to all nodes
+
+- name: Check if gitlab-secrets.json exists on primary app node
+  ansible.builtin.stat:
+    path: /etc/gitlab/gitlab-secrets.json
+  register: _secrets_stat
+  run_once: true
+
+- name: Run initial reconfigure on primary app node to generate secrets
+  ansible.builtin.command:
+    cmd: gitlab-ctl reconfigure
+  run_once: true
+  when: not _secrets_stat.stat.exists
+  changed_when: true
+
+- name: Fetch gitlab-secrets.json from primary app node
+  ansible.builtin.fetch:
+    src: /etc/gitlab/gitlab-secrets.json
+    dest: /tmp/gitlab-secrets.json
+    flat: true
+  run_once: true
+
+- name: Deploy shared gitlab-secrets.json to all app nodes
+  ansible.builtin.copy:
+    src: /tmp/gitlab-secrets.json
+    dest: /etc/gitlab/gitlab-secrets.json
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Reconfigure gitlab
+
+# ============================================================
+# Apply Configuration
+# ============================================================
+# Flush handlers so gitlab-ctl reconfigure runs before we
+# attempt database migrations or service verification.
+
+- name: Flush handlers to apply configuration
+  ansible.builtin.meta: flush_handlers
+
+# ============================================================
+# Database Migrations
+# ============================================================
+# Run on a single node only.  gitlab:db:configure creates the
+# schema on first run and applies pending migrations thereafter.
+
+- name: Run GitLab database migrations
+  ansible.builtin.command:
+    cmd: gitlab-rake gitlab:db:configure
+  run_once: true
+  changed_when: false
+  register: _db_migrate
+
+- name: Display database migration output
+  ansible.builtin.debug:
+    var: _db_migrate.stdout_lines
+  run_once: true
+  when: _db_migrate.stdout_lines | default([]) | length > 0
+
+# ============================================================
+# Service Management
+# ============================================================
+
+- name: Ensure gitlab-runsvdir service is enabled and started
+  ansible.builtin.systemd:
+    name: gitlab-runsvdir
+    enabled: true
+    state: started
+
+# ============================================================
+# Verification
+# ============================================================
+
+- name: Wait for Workhorse to listen on port {{ gitlab_workhorse_port }}
+  ansible.builtin.wait_for:
+    port: "{{ gitlab_workhorse_port }}"
+    host: "{{ ansible_host }}"
+    delay: 10
+    timeout: 180
+
+- name: Verify GitLab services status
+  ansible.builtin.command:
+    cmd: gitlab-ctl status
+  changed_when: false
+  register: _gitlab_status
+
+- name: Display GitLab services status
+  ansible.builtin.debug:
+    var: _gitlab_status.stdout_lines
+
+- name: Verify GitLab sign-in page is accessible
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ gitlab_workhorse_port }}/users/sign_in"
+    status_code:
+      - 200
+      - 302
+    timeout: 30
+  register: _signin_check
+  retries: 5
+  delay: 15
+  until: _signin_check.status in [200, 302]
+
+- name: Display access verification
+  ansible.builtin.debug:
+    msg: |
+      === GitLab Application Node Verification ===
+
+      Sign-in page: HTTP {{ _signin_check.status }}
+
+      Service status:
+        gitlab-ctl status
+
+      Health check (from this node):
+        curl -s http://127.0.0.1:{{ gitlab_workhorse_port }}/users/sign_in
+
+      External access (via load balancer):
+        curl -k {{ gitlab_external_url }}
+
+      Workhorse port (for LB backend):
+        {{ ansible_host }}:{{ gitlab_workhorse_port }}
+
+      GitLab Rake checks:
+        gitlab-rake gitlab:check SANITIZE=true
+        gitlab-rake gitlab:gitaly:check
+        gitlab-rake gitlab:sidekiq:check
+
+      App nodes in this deployment:
+      {% for host in groups['gitlab_app'] %}
+        {{ host }} => {{ hostvars[host]['ansible_host'] }}:{{ gitlab_workhorse_port }}
+      {% endfor %}
+
+      External services:
+        PostgreSQL: {{ gitlab_db_host }}:{{ gitlab_db_port }}
+        Redis Sentinel: {{ redis_sentinel_master_name }}
+      {% for host in groups['redis_cluster'] %}
+          {{ hostvars[host]['ansible_host'] }}:{{ redis_sentinel_port }}
+      {% endfor %}
+        Praefect: {{ hostvars[groups['praefect_cluster'][0]]['ansible_host'] }}:{{ praefect_port }}
+  run_once: true

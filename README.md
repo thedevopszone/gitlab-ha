@@ -11,14 +11,17 @@ High-availability infrastructure for GitLab, managed with Ansible.
 | Redis      | `redis_sentinel` | 3-node Redis with Sentinel for automatic failover  |
 | Gitaly     | `gitaly`         | 3-node Git storage backend (GitLab Omnibus)        |
 | Praefect   | `praefect`       | 3-node Gitaly replication proxy with virtual storage|
+| GitLab App | `gitlab_app`     | 2-node stateless Rails application layer           |
 
 ## Nodes
 
-| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel | Gitaly      | Praefect      |
-|----------------|---------------|:----:|:--------------------:|:----------------:|:-----------:|:-------------:|
-| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     | x (gitaly-1)| x (praefect-1)|
-| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    | x (gitaly-2)| x (praefect-2)|
-| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    | x (gitaly-3)| x (praefect-3)|
+| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel | Gitaly      | Praefect      | GitLab App |
+|----------------|---------------|:----:|:--------------------:|:----------------:|:-----------:|:-------------:|:----------:|
+| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     | x (gitaly-1)| x (praefect-1)|            |
+| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    | x (gitaly-2)| x (praefect-2)|            |
+| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    | x (gitaly-3)| x (praefect-3)|            |
+| gl-prd-app-01  | 172.16.0.237  |      |                      |                  |             |               |     x      |
+| gl-prd-app-02  | 172.16.0.87   |      |                      |                  |             |               |     x      |
 
 ## Prerequisites
 
@@ -39,7 +42,8 @@ gitlab-ha/
 │           ├── patroni.yml               # Patroni / PostgreSQL variables
 │           ├── redis.yml                 # Redis / Sentinel variables
 │           ├── gitaly.yml                # Gitaly cluster variables
-│           └── praefect.yml              # Praefect cluster variables
+│           ├── praefect.yml              # Praefect cluster variables
+│           └── gitlab_app.yml            # GitLab application layer variables
 ├── roles/
 │   ├── etcd/
 │   │   ├── defaults/main.yml
@@ -68,7 +72,13 @@ gitlab-ha/
 │   │   ├── templates/
 │   │   │   └── gitlab.rb.j2
 │   │   └── handlers/main.yml
-│   └── praefect/
+│   ├── praefect/
+│   │   ├── defaults/main.yml
+│   │   ├── tasks/main.yml
+│   │   ├── templates/
+│   │   │   └── gitlab.rb.j2
+│   │   └── handlers/main.yml
+│   └── gitlab_app/
 │       ├── defaults/main.yml
 │       ├── tasks/main.yml
 │       ├── templates/
@@ -79,7 +89,8 @@ gitlab-ha/
     ├── patroni.yml
     ├── redis.yml
     ├── gitaly.yml
-    └── praefect.yml
+    ├── praefect.yml
+    └── gitlab_app.yml
 ```
 
 ## Deployment Order
@@ -87,11 +98,12 @@ gitlab-ha/
 The services must be deployed in the following order. Patroni depends on etcd, and Praefect depends on both Patroni (database) and Gitaly (storage backends):
 
 ```
-1. etcd       →  ansible-playbook playbooks/etcd.yml
-2. patroni    →  ansible-playbook playbooks/patroni.yml
-3. redis      →  ansible-playbook playbooks/redis.yml
-4. gitaly     →  ansible-playbook playbooks/gitaly.yml
-5. praefect   →  ansible-playbook playbooks/praefect.yml
+1. etcd        →  ansible-playbook playbooks/etcd.yml
+2. patroni     →  ansible-playbook playbooks/patroni.yml
+3. redis       →  ansible-playbook playbooks/redis.yml
+4. gitaly      →  ansible-playbook playbooks/gitaly.yml
+5. praefect    →  ansible-playbook playbooks/praefect.yml
+6. gitlab_app  →  ansible-playbook playbooks/gitlab_app.yml
 ```
 
 > All playbooks use the default inventory defined in `ansible.cfg`. You can also specify it explicitly with `-i inventories/production/hosts.yml`.
@@ -1528,3 +1540,328 @@ ansible-playbook playbooks/praefect.yml --ask-vault-pass
 | `praefect:metadata:check` reports inconsistencies | Replication lag or node was down during writes | Check that all Gitaly backends are reachable via `dial-nodes`; Praefect will automatically reconcile once backends are healthy |
 | DB creation task fails with "read-only transaction" | Delegated to a Patroni replica, not the primary | Verify Patroni cluster health (`patronictl list`); ensure the REST API on port 8008 is accessible from the Ansible controller |
 | Praefect connects to wrong DB host after Patroni failover | `praefect_db_host` points to a static IP | Set `praefect_db_host` to a VIP or PgBouncer address that follows the Patroni primary; re-run the playbook |
+
+---
+
+## GitLab Application Layer
+
+### Architecture
+
+| Setting                  | Value                                    |
+|--------------------------|------------------------------------------|
+| GitLab Omnibus version   | 18.8.4-ee                                |
+| External URL             | `https://gitlab.example.local`           |
+| Workhorse port           | `8181` (TCP, for external load balancer) |
+| Puma port                | `8080` (localhost only)                  |
+| Puma workers             | `4`                                      |
+| Sidekiq concurrency      | `20`                                     |
+| Database                 | `gitlabhq_production` (external Patroni) |
+| Database user            | `gitlab`                                 |
+| Redis                    | External Sentinel (`mymaster`)           |
+| Git storage              | External Praefect (`default` virtual)    |
+| Local NGINX              | Disabled                                 |
+| Configuration            | `/etc/gitlab/gitlab.rb`                  |
+| Secrets                  | `/etc/gitlab/gitlab-secrets.json`        |
+
+The application layer consists of two stateless Rails nodes. Both run Puma (web), Sidekiq (background jobs), and Workhorse (Git HTTP frontend). All data services are external — PostgreSQL via Patroni, Redis via Sentinel, and Gitaly via Praefect. NGINX is disabled; an external load balancer terminates TLS and proxies to Workhorse on port 8181.
+
+Both nodes share identical `gitlab-secrets.json` to ensure session cookies, encrypted database columns, and CI/CD variables are interchangeable across the pair.
+
+| Node           | Workhorse endpoint     | Services                       |
+|----------------|------------------------|--------------------------------|
+| gl-prd-app-01  | `172.16.0.237:8181`    | Puma, Sidekiq, Workhorse       |
+| gl-prd-app-02  | `172.16.0.87:8181`     | Puma, Sidekiq, Workhorse       |
+
+### Deploying GitLab Application Layer
+
+> **Prerequisites:**
+> - The Patroni/PostgreSQL cluster must be running (the role creates the `gitlabhq_production` database).
+> - The Redis Sentinel cluster must be running.
+> - The Praefect cluster must be running.
+
+```bash
+ansible-playbook playbooks/gitlab_app.yml
+```
+
+#### What the playbook does
+
+1. Installs prerequisites (`curl`, `gnupg`, `apt-transport-https`)
+2. Adds the official GitLab APT repository signing key and sources list
+3. Creates `/etc/gitlab/` and deploys `gitlab.rb` **before** the package install
+4. Installs the `gitlab-ee` Omnibus package (with `GITLAB_SKIP_RECONFIGURE=true` to prevent the default postinst reconfigure)
+5. **Discovers the Patroni primary** by querying each `postgres_cluster` node's REST API (`GET /primary`)
+6. Creates the `gitlab` PostgreSQL user and `gitlabhq_production` database if not present
+7. Creates required PostgreSQL extensions (`pg_trgm`, `btree_gist`, `pgcrypto`)
+8. **Manages shared secrets:** checks if `gitlab-secrets.json` exists on the primary app node; if not, runs an initial `gitlab-ctl reconfigure` to generate it; then fetches and distributes the same secrets file to all app nodes
+9. Runs `gitlab-ctl reconfigure` on all nodes (handler, triggered by `gitlab.rb` or secrets changes)
+10. Runs `gitlab-rake gitlab:db:configure` once (schema creation + migrations + seeding)
+11. Ensures `gitlab-runsvdir` systemd service is enabled and started
+12. Waits for Workhorse port 8181 on every node
+13. Validates `gitlab-ctl status` on every node
+14. Verifies the sign-in page returns HTTP 200 via `curl`
+
+The playbook is fully idempotent. On subsequent runs, only nodes with changed configuration are reconfigured. Database and user creation tasks check for existence before executing.
+
+#### First-time deployment (full stack)
+
+```bash
+ansible-playbook playbooks/etcd.yml
+ansible-playbook playbooks/patroni.yml
+ansible-playbook playbooks/redis.yml
+ansible-playbook playbooks/gitaly.yml
+ansible-playbook playbooks/praefect.yml
+ansible-playbook playbooks/gitlab_app.yml
+```
+
+### Checking Application Health
+
+#### Quick check — all services running
+
+```bash
+ansible gitlab_app -b -m shell -a "gitlab-ctl status"
+```
+
+Expected output when healthy (per node):
+
+```
+run: gitlab-exporter: (pid ...) ...s
+run: gitlab-workhorse: (pid ...) ...s
+run: logrotate: (pid ...) ...s
+run: node-exporter: (pid ...) ...s
+run: puma: (pid ...) ...s
+run: sidekiq: (pid ...) ...s
+```
+
+All six services should show `run:` with an active PID.
+
+#### Verify Workhorse is listening
+
+```bash
+ansible gitlab_app -b -m shell -a "ss -tlnp | grep 8181"
+```
+
+#### Sign-in page health check
+
+```bash
+# From any app node
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8181/users/sign_in
+# Expected: 200
+
+# Via external load balancer
+curl -k https://gitlab.example.local/users/sign_in
+```
+
+#### GitLab Rake checks
+
+```bash
+# Comprehensive check
+ssh gl-prd-app-01 'sudo gitlab-rake gitlab:check SANITIZE=true'
+
+# Gitaly / Praefect connectivity
+ssh gl-prd-app-01 'sudo gitlab-rake gitlab:gitaly:check'
+
+# Sidekiq health
+ssh gl-prd-app-01 'sudo gitlab-rake gitlab:sidekiq:check'
+```
+
+#### Database connectivity
+
+```bash
+ssh gl-prd-app-01 'sudo gitlab-rails dbconsole -- -c "SELECT 1;"'
+```
+
+#### Redis connectivity
+
+```bash
+ssh gl-prd-app-01 'sudo gitlab-rails runner "puts Gitlab::Redis::SharedState.with(&:ping)"'
+```
+
+#### Application logs
+
+```bash
+# Puma (web)
+ssh gl-prd-app-01 'sudo gitlab-ctl tail puma'
+
+# Sidekiq (background jobs)
+ssh gl-prd-app-01 'sudo gitlab-ctl tail sidekiq'
+
+# Workhorse (HTTP frontend)
+ssh gl-prd-app-01 'sudo gitlab-ctl tail gitlab-workhorse'
+
+# All GitLab logs
+ssh gl-prd-app-01 'sudo gitlab-ctl tail'
+```
+
+### Updating Application Configuration
+
+#### Changing parameters
+
+1. Edit the variables in `inventories/production/group_vars/gitlab_app.yml`, or modify the template directly at `roles/gitlab_app/templates/gitlab.rb.j2`.
+
+   Common tunables (in `group_vars/gitlab_app.yml`):
+
+   | Variable                       | Default                      | Description                              |
+   |--------------------------------|------------------------------|------------------------------------------|
+   | `gitlab_external_url`          | `https://gitlab.example.local`| External URL (affects generated links)  |
+   | `gitlab_db_host`               | *(first postgres node)*      | Database host (use VIP in production)    |
+   | `gitlab_db_password`           | `changeme-gitlab-db`         | Database password (use vault)            |
+   | `redis_sentinel_master_name`   | `mymaster`                   | Redis Sentinel master name               |
+   | `praefect_auth_token`          | `changeme-praefect-secret`   | Praefect auth token (must match cluster) |
+   | `puma_worker_processes`        | `4`                          | Number of Puma worker processes          |
+   | `puma_min_threads`             | `4`                          | Puma minimum threads per worker          |
+   | `puma_max_threads`             | `4`                          | Puma maximum threads per worker          |
+   | `sidekiq_concurrency`          | `20`                         | Sidekiq job concurrency                  |
+   | `gitlab_workhorse_port`        | `8181`                       | Workhorse TCP listen port                |
+
+2. Run the playbook:
+
+   ```bash
+   ansible-playbook playbooks/gitlab_app.yml
+   ```
+
+   Only nodes with changed `gitlab.rb` will run `gitlab-ctl reconfigure` (via handlers).
+
+3. Verify the application is healthy after the run (see checks above).
+
+#### Changing the database connection
+
+To point GitLab to a VIP or PgBouncer instead of the first Patroni node:
+
+1. Update `gitlab_db_host` in `inventories/production/group_vars/gitlab_app.yml`:
+
+   ```yaml
+   gitlab_db_host: "10.0.0.100"  # VIP or PgBouncer address
+   ```
+
+2. Re-run the playbook.
+
+#### Changing the Praefect endpoint
+
+In production, the `repositories_storages` address should point to a TCP load balancer in front of the Praefect cluster. The default points to the first Praefect node. To change this, edit the `gitlab.rb.j2` template or override via a variable.
+
+### Shared Secrets Management
+
+Both app nodes must share identical `gitlab-secrets.json`. The role handles this automatically:
+
+1. On the **first** run, secrets are generated on `gl-prd-app-01` via `gitlab-ctl reconfigure`.
+2. The secrets file is fetched to the Ansible controller (`/tmp/gitlab-secrets.json`).
+3. The file is distributed to all app nodes.
+4. On subsequent runs, secrets are fetched and compared — no change means no reconfigure.
+
+**Manual secret rotation** is not recommended unless you understand the implications (all encrypted data in the database becomes unreadable if `db_key_base` changes). If you must rotate secrets:
+
+1. Back up `/etc/gitlab/gitlab-secrets.json` from any app node.
+2. Rotate the specific key (e.g., `secret_key_base`) on one node.
+3. Copy the updated file to all other app nodes.
+4. Run `gitlab-ctl reconfigure` on all nodes.
+
+### Upgrading GitLab Omnibus (Application Layer)
+
+The role installs `gitlab-ee` via `apt` with `state: present`, which does not upgrade an already-installed package.
+
+#### Checking current version
+
+```bash
+ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+```
+
+#### Rolling upgrade (recommended)
+
+Upgrade one node at a time to maintain availability behind the load balancer.
+
+**Step 1 — Remove the first node from the load balancer pool, then upgrade:**
+
+```bash
+# Upgrade the package (skip automatic reconfigure)
+ansible gl-prd-app-01 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes" \
+  -e '{"ansible_env": {"GITLAB_SKIP_RECONFIGURE": "true"}}'
+
+# Reconfigure and run migrations
+ansible gl-prd-app-01 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-app-01 -b -m shell -a "gitlab-rake gitlab:db:configure"
+
+# Verify services
+ansible gl-prd-app-01 -b -m shell -a "gitlab-ctl status"
+
+# Verify sign-in page
+ansible gl-prd-app-01 -b -m shell -a \
+  "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8181/users/sign_in"
+```
+
+Add `gl-prd-app-01` back to the load balancer pool.
+
+**Step 2 — Repeat for the second node:**
+
+```bash
+ansible gl-prd-app-02 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes" \
+  -e '{"ansible_env": {"GITLAB_SKIP_RECONFIGURE": "true"}}'
+ansible gl-prd-app-02 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-app-02 -b -m shell -a "gitlab-ctl status"
+```
+
+> **Note:** Database migrations (`gitlab-rake gitlab:db:configure`) only need to run on one node. They were already applied in Step 1.
+
+**Step 3 — Final verification:**
+
+```bash
+ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+ansible gitlab_app -b -m shell -a "gitlab-ctl status"
+```
+
+### Load Balancer Configuration
+
+The external load balancer should be configured to:
+
+1. **Terminate TLS** on port 443 with the certificate for `gitlab.example.local`.
+2. **Proxy to Workhorse** on the app nodes:
+   - Backend: `172.16.0.237:8181` and `172.16.0.87:8181`
+   - Protocol: HTTP
+   - Health check: `GET /users/sign_in` → HTTP 200
+3. **Forward headers** for correct client IP detection:
+   - `X-Forwarded-For`
+   - `X-Forwarded-Proto: https`
+
+Example health check endpoint for the LB:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://172.16.0.237:8181/users/sign_in
+```
+
+### Credentials
+
+| Credential              | Variable                | Location                                        |
+|-------------------------|-------------------------|-------------------------------------------------|
+| GitLab DB password      | `gitlab_db_password`    | `group_vars/gitlab_app.yml`                     |
+| Praefect auth token     | `praefect_auth_token`   | `group_vars/gitlab_app.yml`                     |
+
+For production use, encrypt sensitive variables with Ansible Vault:
+
+```bash
+ansible-vault encrypt inventories/production/group_vars/gitlab_app.yml
+ansible-playbook playbooks/gitlab_app.yml --ask-vault-pass
+```
+
+### Key File Locations (on nodes)
+
+| File                                       | Description                                |
+|--------------------------------------------|--------------------------------------------|
+| `/etc/gitlab/gitlab.rb`                    | GitLab Omnibus configuration               |
+| `/etc/gitlab/gitlab-secrets.json`          | Shared secrets (identical on both nodes)   |
+| `/var/opt/gitlab/`                         | GitLab runtime data                        |
+| `/var/log/gitlab/puma/`                    | Puma log directory                         |
+| `/var/log/gitlab/sidekiq/`                 | Sidekiq log directory                      |
+| `/var/log/gitlab/gitlab-workhorse/`        | Workhorse log directory                    |
+
+### GitLab Application Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `gitlab-ctl status` shows `puma` as `down` | Puma crashed or can't connect to DB | Check `gitlab-ctl tail puma`; verify DB connectivity with `gitlab-rails dbconsole` |
+| `gitlab-ctl status` shows `sidekiq` as `down` | Sidekiq crashed or can't connect to Redis | Check `gitlab-ctl tail sidekiq`; verify Redis connectivity |
+| Sign-in page returns 502 | Puma not ready or Workhorse can't reach Puma | Wait for Puma to fully start (can take 60-90s); check `gitlab-ctl tail puma` |
+| `Couldn't locate a replica for role: gitlab-redis` | Wrong Redis Sentinel master name in `gitlab.rb` | Verify `redis['master_name']` matches the Sentinel cluster's master name (`mymaster`); use `redis['master_name']` NOT `gitlab_rails['redis_master_name']` |
+| `gitlab-rake gitlab:db:configure` fails | DB unreachable or user lacks privileges | Verify `gitlab_db_host`/`gitlab_db_password`; check Patroni cluster health; ensure `gitlab` user has CREATEDB privilege |
+| Secrets mismatch between nodes | Different `gitlab-secrets.json` on each node | Re-run the playbook — it fetches from the primary and distributes to all nodes |
+| `gitlab-ctl reconfigure` fails with "Removed configurations found" | Using deprecated settings in `gitlab.rb` | Check for `git_data_dirs()` (removed in 18.0), `grafana['enable']` (removed); update template |
+| Sessions not shared between nodes | Different `secret_key_base` on each node | Verify `/etc/gitlab/gitlab-secrets.json` is identical on both nodes; re-run the playbook |
+| Gitaly connection errors | Praefect auth token mismatch or Praefect unreachable | Verify `praefect_auth_token` matches the Praefect cluster; check port 2305 connectivity to Praefect nodes |
