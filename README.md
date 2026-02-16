@@ -1549,7 +1549,7 @@ ansible-playbook playbooks/praefect.yml --ask-vault-pass
 
 | Setting                  | Value                                    |
 |--------------------------|------------------------------------------|
-| GitLab Omnibus version   | 18.8.4-ee                                |
+| GitLab Omnibus version   | GitLab CE (Community Edition)            |
 | External URL             | `https://gitlab.example.local`           |
 | Workhorse port           | `8181` (TCP, for external load balancer) |
 | Puma port                | `8080` (localhost only)                  |
@@ -1588,7 +1588,7 @@ ansible-playbook playbooks/gitlab_app.yml
 1. Installs prerequisites (`curl`, `gnupg`, `apt-transport-https`)
 2. Adds the official GitLab APT repository signing key and sources list
 3. Creates `/etc/gitlab/` and deploys `gitlab.rb` **before** the package install
-4. Installs the `gitlab-ee` Omnibus package (with `GITLAB_SKIP_RECONFIGURE=true` to prevent the default postinst reconfigure)
+4. Installs the `gitlab-ce` Omnibus package (with `GITLAB_SKIP_RECONFIGURE=true` to prevent the default postinst reconfigure)
 5. **Discovers the Patroni primary** by querying each `postgres_cluster` node's REST API (`GET /primary`)
 6. Creates the `gitlab` PostgreSQL user and `gitlabhq_production` database if not present
 7. Creates required PostgreSQL extensions (`pg_trgm`, `btree_gist`, `pgcrypto`)
@@ -1757,12 +1757,12 @@ Both app nodes must share identical `gitlab-secrets.json`. The role handles this
 
 ### Upgrading GitLab Omnibus (Application Layer)
 
-The role installs `gitlab-ee` via `apt` with `state: present`, which does not upgrade an already-installed package.
+The role installs `gitlab-ce` via `apt` with `state: present`, which does not upgrade an already-installed package.
 
 #### Checking current version
 
 ```bash
-ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ce | tail -1 | awk '{print \$3}'"
 ```
 
 #### Rolling upgrade (recommended)
@@ -1773,7 +1773,7 @@ Upgrade one node at a time to maintain availability behind the load balancer.
 
 ```bash
 # Upgrade the package (skip automatic reconfigure)
-ansible gl-prd-app-01 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes" \
+ansible gl-prd-app-01 -b -m apt -a "name=gitlab-ce state=latest update_cache=yes" \
   -e '{"ansible_env": {"GITLAB_SKIP_RECONFIGURE": "true"}}'
 
 # Reconfigure and run migrations
@@ -1793,7 +1793,7 @@ Add `gl-prd-app-01` back to the load balancer pool.
 **Step 2 — Repeat for the second node:**
 
 ```bash
-ansible gl-prd-app-02 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes" \
+ansible gl-prd-app-02 -b -m apt -a "name=gitlab-ce state=latest update_cache=yes" \
   -e '{"ansible_env": {"GITLAB_SKIP_RECONFIGURE": "true"}}'
 ansible gl-prd-app-02 -b -m shell -a "gitlab-ctl reconfigure"
 ansible gl-prd-app-02 -b -m shell -a "gitlab-ctl status"
@@ -1804,7 +1804,7 @@ ansible gl-prd-app-02 -b -m shell -a "gitlab-ctl status"
 **Step 3 — Final verification:**
 
 ```bash
-ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+ansible gitlab_app -b -m shell -a "dpkg -l gitlab-ce | tail -1 | awk '{print \$3}'"
 ansible gitlab_app -b -m shell -a "gitlab-ctl status"
 ```
 
