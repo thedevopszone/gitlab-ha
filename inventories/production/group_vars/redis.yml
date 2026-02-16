@@ -1,0 +1,18 @@
+---
+# Redis + Sentinel cluster configuration
+
+# Redis
+redis_port: 6379
+redis_bind: "0.0.0.0"
+redis_maxmemory: "256mb"
+redis_maxmemory_policy: "noeviction"
+redis_appendonly: "yes"
+redis_appendfsync: "everysec"
+
+# Sentinel
+redis_sentinel_port: 26379
+redis_sentinel_master_name: "mymaster"
+redis_sentinel_quorum: 2
+redis_sentinel_down_after_ms: 5000
+redis_sentinel_failover_timeout: 10000
+redis_sentinel_parallel_syncs: 1

@@ -1,0 +1,124 @@
+---
+# ============================================================
+# Redis Server Installation
+# ============================================================
+
+- name: Install redis-server and redis-sentinel
+  ansible.builtin.apt:
+    name:
+      - redis-server
+      - redis-sentinel
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ============================================================
+# Redis Server Configuration
+# ============================================================
+
+- name: Deploy redis.conf
+  ansible.builtin.template:
+    src: redis.conf.j2
+    dest: /etc/redis/redis.conf
+    owner: redis
+    group: redis
+    mode: "0640"
+  notify: Restart redis
+
+- name: Enable and start redis-server
+  ansible.builtin.systemd:
+    name: redis-server
+    enabled: true
+    state: started
+
+# ============================================================
+# Redis Sentinel Configuration
+# ============================================================
+
+- name: Deploy sentinel.conf
+  ansible.builtin.template:
+    src: sentinel.conf.j2
+    dest: /etc/redis/sentinel.conf
+    owner: redis
+    group: redis
+    mode: "0640"
+  notify: Restart sentinel
+
+- name: Enable and start redis-sentinel
+  ansible.builtin.systemd:
+    name: redis-sentinel
+    enabled: true
+    state: started
+
+# ============================================================
+# Verification
+# ============================================================
+
+- name: Flush handlers before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for Redis port {{ redis_port }}
+  ansible.builtin.wait_for:
+    port: "{{ redis_port }}"
+    host: "{{ ansible_host }}"
+    delay: 2
+    timeout: 30
+
+- name: Wait for Sentinel port {{ redis_sentinel_port }}
+  ansible.builtin.wait_for:
+    port: "{{ redis_sentinel_port }}"
+    host: "{{ ansible_host }}"
+    delay: 2
+    timeout: 30
+
+- name: Check Redis replication info
+  ansible.builtin.command:
+    cmd: redis-cli -h {{ ansible_host }} -p {{ redis_port }} INFO replication
+  changed_when: false
+  register: redis_replication_info
+  run_once: true
+
+- name: Display Redis replication info
+  ansible.builtin.debug:
+    var: redis_replication_info.stdout_lines
+  run_once: true
+
+- name: Query Sentinel for master status
+  ansible.builtin.command:
+    cmd: redis-cli -h {{ ansible_host }} -p {{ redis_sentinel_port }} SENTINEL masters
+  changed_when: false
+  register: sentinel_master_info
+  run_once: true
+
+- name: Display Sentinel master info
+  ansible.builtin.debug:
+    var: sentinel_master_info.stdout_lines
+  run_once: true
+
+- name: Display verification commands
+  ansible.builtin.debug:
+    msg: |
+      === Redis + Sentinel Cluster Verification ===
+
+      Check replication status (run from any node):
+        redis-cli -h {{ redis_master_ip }} -p {{ redis_port }} INFO replication
+
+      Query Sentinel for current master:
+        redis-cli -p {{ redis_sentinel_port }} SENTINEL masters
+        redis-cli -p {{ redis_sentinel_port }} SENTINEL get-master-addr-by-name {{ redis_sentinel_master_name }}
+
+      List replicas known to Sentinel:
+        redis-cli -p {{ redis_sentinel_port }} SENTINEL replicas {{ redis_sentinel_master_name }}
+
+      Test failover (triggers manual failover):
+        redis-cli -p {{ redis_sentinel_port }} SENTINEL failover {{ redis_sentinel_master_name }}
+
+      After failover, verify new master:
+        redis-cli -p {{ redis_sentinel_port }} SENTINEL get-master-addr-by-name {{ redis_sentinel_master_name }}
+
+      Write/read test:
+        redis-cli -h {{ redis_master_ip }} -p {{ redis_port }} SET testkey "hello-ha"
+      {% for host in groups['redis_cluster'] %}
+        redis-cli -h {{ hostvars[host]['ansible_host'] }} -p {{ redis_port }} GET testkey
+      {% endfor %}
+  run_once: true

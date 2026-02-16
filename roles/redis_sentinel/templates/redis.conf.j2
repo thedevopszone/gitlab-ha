@@ -1,0 +1,56 @@
+# {{ ansible_managed }}
+# Redis configuration for {{ inventory_hostname }}
+
+# Network
+bind {{ redis_bind }}
+port {{ redis_port }}
+protected-mode no
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+
+# General
+daemonize no
+pidfile {{ redis_pidfile }}
+loglevel notice
+logfile {{ redis_logfile }}
+databases 16
+
+# Snapshotting
+save 3600 1
+save 300 100
+save 60 10000
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+dir {{ redis_dir }}
+
+# Append only file
+appendonly {{ redis_appendonly }}
+appendfilename "appendonly.aof"
+appendfsync {{ redis_appendfsync }}
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Memory
+maxmemory {{ redis_maxmemory }}
+maxmemory-policy {{ redis_maxmemory_policy }}
+
+# Replication
+{% if redis_node_role == 'replica' %}
+replicaof {{ redis_master_ip }} {{ redis_port }}
+{% endif %}
+replica-serve-stale-data yes
+replica-read-only yes
+repl-diskless-sync yes
+repl-diskless-sync-delay 5
+repl-timeout 60
+
+# Slow log
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+
+# Latency monitor
+latency-monitor-threshold 0

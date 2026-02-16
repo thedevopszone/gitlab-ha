@@ -4,18 +4,19 @@ High-availability infrastructure for GitLab, managed with Ansible.
 
 ## Components
 
-| Component  | Role     | Description                                      |
-|------------|----------|--------------------------------------------------|
-| etcd       | `etcd`   | 3-node distributed key-value store (DCS)         |
-| PostgreSQL | `patroni`| 3-node PostgreSQL 16 cluster managed by Patroni  |
+| Component  | Role             | Description                                      |
+|------------|------------------|--------------------------------------------------|
+| etcd       | `etcd`           | 3-node distributed key-value store (DCS)         |
+| PostgreSQL | `patroni`        | 3-node PostgreSQL 16 cluster managed by Patroni  |
+| Redis      | `redis_sentinel` | 3-node Redis with Sentinel for automatic failover|
 
 ## Nodes
 
-| Host           | IP            | etcd | PostgreSQL / Patroni |
-|----------------|---------------|:----:|:--------------------:|
-| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |
-| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |
-| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |
+| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel |
+|----------------|---------------|:----:|:--------------------:|:----------------:|
+| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     |
+| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    |
+| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    |
 
 ## Prerequisites
 
@@ -33,7 +34,8 @@ gitlab-ha/
 │       ├── hosts.yml                      # all host/group definitions
 │       └── group_vars/
 │           ├── etcd_cluster.yml           # etcd cluster variables
-│           └── patroni.yml               # Patroni / PostgreSQL variables
+│           ├── patroni.yml               # Patroni / PostgreSQL variables
+│           └── redis.yml                 # Redis / Sentinel variables
 ├── roles/
 │   ├── etcd/
 │   │   ├── defaults/main.yml
@@ -42,16 +44,24 @@ gitlab-ha/
 │   │   │   ├── etcd.conf.yml.j2
 │   │   │   └── etcd.service.j2
 │   │   └── handlers/main.yml
-│   └── patroni/
+│   ├── patroni/
+│   │   ├── defaults/main.yml
+│   │   ├── tasks/main.yml
+│   │   ├── templates/
+│   │   │   ├── patroni.yml.j2
+│   │   │   └── patroni.service.j2
+│   │   └── handlers/main.yml
+│   └── redis_sentinel/
 │       ├── defaults/main.yml
 │       ├── tasks/main.yml
 │       ├── templates/
-│       │   ├── patroni.yml.j2
-│       │   └── patroni.service.j2
+│       │   ├── redis.conf.j2
+│       │   └── sentinel.conf.j2
 │       └── handlers/main.yml
 └── playbooks/
     ├── etcd.yml
-    └── patroni.yml
+    ├── patroni.yml
+    └── redis.yml
 ```
 
 ## Deployment Order
@@ -61,6 +71,7 @@ The services must be deployed in the following order because Patroni depends on 
 ```
 1. etcd       →  ansible-playbook playbooks/etcd.yml
 2. patroni    →  ansible-playbook playbooks/patroni.yml
+3. redis      →  ansible-playbook playbooks/redis.yml
 ```
 
 > Both playbooks use the default inventory defined in `ansible.cfg`. You can also specify it explicitly with `-i inventories/production/hosts.yml`.
@@ -535,3 +546,316 @@ ansible-playbook playbooks/patroni.yml --ask-vault-pass
 | `systemctl status patroni` shows `failed` | Configuration error or port conflict | Check `journalctl -u patroni -n 50`; verify `/etc/patroni/patroni.yml` syntax |
 | PostgreSQL starts but clients can't connect | pg_hba rules too restrictive | Check `postgresql_network_cidr` variable; re-run playbook after adjusting |
 | Timeline divergence after failover | Replica was promoted, old leader rejoined without rewind | Ensure `use_pg_rewind: true` is set (default); reinitialize the affected node if needed |
+
+---
+
+## Redis / Sentinel Cluster
+
+### Architecture
+
+| Setting                | Value                    |
+|------------------------|--------------------------|
+| Redis port             | `6379`                   |
+| Sentinel port          | `26379`                  |
+| Sentinel master name   | `mymaster`               |
+| Quorum                 | `2`                      |
+| Down-after-milliseconds| `5000`                   |
+| Failover timeout       | `10000`                  |
+| Append-only file       | enabled                  |
+| Max memory             | `256mb`                  |
+| Max memory policy      | `noeviction`             |
+| Configuration          | `/etc/redis/redis.conf`  |
+| Sentinel configuration | `/etc/redis/sentinel.conf`|
+| Data directory         | `/var/lib/redis`         |
+
+The cluster runs one Redis instance and one Sentinel instance per node. `gl-prd-core-01` is configured as the initial master; the other two nodes start as replicas. Sentinel handles automatic failover — if the master goes down, Sentinel promotes a replica within `down-after-milliseconds + failover-timeout` (roughly 15 seconds).
+
+### Deploying Redis / Sentinel
+
+> **Note:** Redis is independent of etcd and Patroni. It can be deployed at any time, but the recommended order keeps it after the database layer is up.
+
+```bash
+ansible-playbook playbooks/redis.yml
+```
+
+#### What the playbook does
+
+1. Installs `redis-server` and `redis-sentinel` via apt
+2. Deploys `/etc/redis/redis.conf` from template (per-node: master gets no `replicaof`, replicas point to the master dynamically)
+3. Deploys `/etc/redis/sentinel.conf` from template (identical monitoring config, per-node `announce-ip`)
+4. Enables and starts both `redis-server` and `redis-sentinel` systemd services
+5. Waits for ports 6379 and 26379 to become available on every node
+6. Prints replication info and Sentinel status
+
+The playbook is fully idempotent. Configuration changes trigger handler-based restarts only when files actually change.
+
+### Checking Cluster Health
+
+#### Quick check — all services running
+
+```bash
+ansible redis_cluster -b -m shell -a "systemctl is-active redis-server && systemctl is-active redis-sentinel"
+```
+
+Expected output when healthy:
+
+```
+gl-prd-core-01 | CHANGED | rc=0 >> active
+active
+gl-prd-core-02 | CHANGED | rc=0 >> active
+active
+gl-prd-core-03 | CHANGED | rc=0 >> active
+active
+```
+
+#### Replication status
+
+Run on any node (or target the current master):
+
+```bash
+redis-cli -h 172.16.0.183 -p 6379 INFO replication
+```
+
+Healthy master output includes:
+
+```
+role:master
+connected_slaves:2
+slave0:ip=172.16.0.147,port=6379,state=online,offset=...,lag=0
+slave1:ip=172.16.0.145,port=6379,state=online,offset=...,lag=0
+```
+
+Verify that:
+- `role` is `master` on exactly one node
+- `connected_slaves` is `2`
+- Both replicas show `state=online` and `lag=0` or `lag=1`
+
+To check replication from all nodes at once:
+
+```bash
+ansible redis_cluster -b -m shell -a "redis-cli -h {{ ansible_host }} INFO replication | head -5"
+```
+
+#### Sentinel status
+
+```bash
+# List monitored masters
+redis-cli -p 26379 SENTINEL masters
+
+# Get current master address
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+
+# List known replicas
+redis-cli -p 26379 SENTINEL replicas mymaster
+
+# List known sentinels
+redis-cli -p 26379 SENTINEL sentinels mymaster
+```
+
+Key values to verify in `SENTINEL masters` output:
+
+| Field                | Expected value |
+|----------------------|----------------|
+| `name`               | `mymaster`     |
+| `flags`              | `master`       |
+| `num-slaves`         | `2`            |
+| `num-other-sentinels`| `2`            |
+| `quorum`             | `2`            |
+
+#### Data read/write test
+
+```bash
+# Write to master
+redis-cli -h 172.16.0.183 SET healthcheck "ok"
+
+# Read from each replica (should return "ok")
+redis-cli -h 172.16.0.147 GET healthcheck
+redis-cli -h 172.16.0.145 GET healthcheck
+
+# Clean up
+redis-cli -h 172.16.0.183 DEL healthcheck
+```
+
+#### Logs
+
+```bash
+# Redis server logs
+ssh gl-prd-core-01 'journalctl -u redis-server --no-pager -n 50'
+
+# Sentinel logs
+ssh gl-prd-core-01 'journalctl -u redis-sentinel --no-pager -n 50'
+```
+
+### Updating Redis Configuration
+
+#### Changing parameters
+
+1. Edit the variables in `inventories/production/group_vars/redis.yml`, or modify the templates directly in `roles/redis_sentinel/templates/`.
+
+   Common tunables (in `group_vars/redis.yml`):
+
+   | Variable                         | Default       | Description                           |
+   |----------------------------------|---------------|---------------------------------------|
+   | `redis_maxmemory`                | `256mb`       | Max memory before eviction policy     |
+   | `redis_maxmemory_policy`         | `noeviction`  | Eviction policy when maxmemory hit    |
+   | `redis_appendonly`               | `yes`         | Enable append-only persistence        |
+   | `redis_appendfsync`              | `everysec`    | AOF fsync frequency                   |
+   | `redis_sentinel_down_after_ms`   | `5000`        | Time before marking master as down    |
+   | `redis_sentinel_failover_timeout`| `10000`       | Failover timeout in milliseconds      |
+   | `redis_sentinel_quorum`          | `2`           | Sentinels needed to agree on failover |
+
+2. Run the playbook:
+
+   ```bash
+   ansible-playbook playbooks/redis.yml
+   ```
+
+   Only nodes with changed configuration files will be restarted via handlers.
+
+3. Verify the cluster is healthy after the run (see checks above).
+
+> **Note on Sentinel config rewrites:** Sentinel modifies its own configuration file at runtime to track discovered replicas and other sentinels. Re-running the playbook re-templates `sentinel.conf` and restarts Sentinel, which then re-discovers the cluster topology within seconds. This is safe and expected.
+
+### Upgrading Redis Packages
+
+The role installs Redis via `apt` with `state: present`, which does not upgrade an already-installed package.
+
+#### Rolling upgrade (recommended)
+
+Upgrade one node at a time, starting with replicas, then the master. This maintains availability throughout the upgrade.
+
+**Step 1 — Upgrade replicas first:**
+
+```bash
+# Upgrade the first replica
+ansible gl-prd-core-02 -b -m apt -a "name=redis-server,redis-sentinel state=latest update_cache=yes"
+ansible gl-prd-core-02 -b -m systemd -a "name=redis-server state=restarted"
+ansible gl-prd-core-02 -b -m systemd -a "name=redis-sentinel state=restarted"
+
+# Verify it rejoined as replica
+redis-cli -h 172.16.0.147 INFO replication | grep role
+# Expected: role:slave
+
+# Upgrade the second replica
+ansible gl-prd-core-03 -b -m apt -a "name=redis-server,redis-sentinel state=latest update_cache=yes"
+ansible gl-prd-core-03 -b -m systemd -a "name=redis-server state=restarted"
+ansible gl-prd-core-03 -b -m systemd -a "name=redis-sentinel state=restarted"
+
+# Verify it rejoined
+redis-cli -h 172.16.0.145 INFO replication | grep role
+# Expected: role:slave
+```
+
+**Step 2 — Failover away from the master, then upgrade it:**
+
+```bash
+# Trigger a failover so the master moves to an already-upgraded replica
+redis-cli -p 26379 SENTINEL failover mymaster
+
+# Wait a few seconds, then confirm the new master
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+
+# Now upgrade the old master (which is now a replica)
+ansible gl-prd-core-01 -b -m apt -a "name=redis-server,redis-sentinel state=latest update_cache=yes"
+ansible gl-prd-core-01 -b -m systemd -a "name=redis-server state=restarted"
+ansible gl-prd-core-01 -b -m systemd -a "name=redis-sentinel state=restarted"
+```
+
+**Step 3 — Final verification:**
+
+```bash
+# Check all nodes are running the new version
+ansible redis_cluster -b -m shell -a "redis-server --version"
+
+# Verify cluster health
+redis-cli -p 26379 SENTINEL masters
+redis-cli -h $(redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster | head -1) INFO replication
+```
+
+### Failover
+
+#### Automatic failover
+
+Sentinel monitors the master with `down-after-milliseconds: 5000`. If the master becomes unreachable for 5 seconds, Sentinels vote (quorum = 2 of 3) and promote a replica. The `failover-timeout` is 10 seconds. Total time from master failure to promotion is roughly 5–15 seconds.
+
+No manual intervention is required.
+
+#### Manual failover
+
+To trigger a planned failover (e.g. for maintenance on the current master):
+
+```bash
+# Trigger failover
+redis-cli -p 26379 SENTINEL failover mymaster
+
+# Wait ~5 seconds, then verify the new master
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+```
+
+#### Testing failover
+
+1. Identify the current master:
+
+   ```bash
+   redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+   ```
+
+2. Stop Redis on the master node (e.g. `gl-prd-core-01`):
+
+   ```bash
+   ssh gl-prd-core-01 'sudo systemctl stop redis-server'
+   ```
+
+3. Wait 5–15 seconds, then check that Sentinel promoted a replica:
+
+   ```bash
+   redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+   ```
+
+   The returned IP should be one of the replicas.
+
+4. Verify the cluster is functional:
+
+   ```bash
+   # Write to the new master
+   NEW_MASTER=$(redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster | head -1)
+   redis-cli -h $NEW_MASTER SET failover-test "passed"
+   redis-cli -h $NEW_MASTER GET failover-test
+   ```
+
+5. Bring the old master back:
+
+   ```bash
+   ssh gl-prd-core-01 'sudo systemctl start redis-server'
+   ```
+
+   It will automatically rejoin as a replica of the new master.
+
+6. Clean up:
+
+   ```bash
+   redis-cli -h $NEW_MASTER DEL failover-test
+   ```
+
+### Key File Locations (on nodes)
+
+| File                               | Description                          |
+|------------------------------------|--------------------------------------|
+| `/etc/redis/redis.conf`           | Redis server configuration           |
+| `/etc/redis/sentinel.conf`        | Sentinel configuration (runtime-modified) |
+| `/var/lib/redis/`                 | Data directory (RDB + AOF files)     |
+| `/var/log/redis/redis-server.log` | Redis server log                     |
+| `/var/log/redis/redis-sentinel.log`| Sentinel log                        |
+
+### Redis Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `systemctl status redis-server` shows `inactive` | Service crashed or was stopped | `systemctl start redis-server`, check logs with `journalctl -u redis-server` |
+| `connected_slaves` is `0` or `1` on master | Replica down or network issue | Check `systemctl status redis-server` on replicas; verify connectivity on port 6379 between nodes |
+| `SENTINEL masters` shows `flags` containing `s_down` or `o_down` | Master unreachable by sentinels | Check if Redis is running on the master node; check network connectivity on ports 6379 and 26379 |
+| `num-other-sentinels` is less than `2` | A Sentinel instance is down | Check `systemctl status redis-sentinel` on all nodes; restart any stopped sentinels |
+| Replica shows `master_link_status:down` | Master unreachable from replica | Verify the master is running; check network between the replica and master on port 6379 |
+| Sentinel keeps failing over repeatedly | Flapping — master is unstable | Check master node health (CPU, memory, disk); increase `down-after-milliseconds` if the master is slow but functional |
+| After failover, old master doesn't rejoin as replica | Sentinel couldn't reconfigure it | Restart Redis on the old master: `systemctl restart redis-server`; Sentinel will reconfigure it |
+| `MISCONF` errors on writes | AOF/RDB save failed (disk full or permissions) | Check disk space on `/var/lib/redis`; verify `redis` user owns the data directory |

@@ -1,0 +1,6 @@
+---
+- name: Deploy Redis with Sentinel for HA
+  hosts: redis_cluster
+  become: true
+  roles:
+    - redis_sentinel

@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# Redis Sentinel configuration for {{ inventory_hostname }}
+
+# Network
+bind {{ redis_bind }}
+port {{ redis_sentinel_port }}
+protected-mode no
+
+daemonize no
+pidfile /run/redis/redis-sentinel.pid
+logfile {{ redis_sentinel_logfile }}
+dir {{ redis_sentinel_dir }}
+
+# Monitor master
+sentinel monitor {{ redis_sentinel_master_name }} {{ redis_master_ip }} {{ redis_port }} {{ redis_sentinel_quorum }}
+
+# Timing
+sentinel down-after-milliseconds {{ redis_sentinel_master_name }} {{ redis_sentinel_down_after_ms }}
+sentinel failover-timeout {{ redis_sentinel_master_name }} {{ redis_sentinel_failover_timeout }}
+sentinel parallel-syncs {{ redis_sentinel_master_name }} {{ redis_sentinel_parallel_syncs }}
+
+# Announce this sentinel's reachable address
+sentinel announce-ip {{ ansible_host }}
+sentinel announce-port {{ redis_sentinel_port }}
+
+# Resolve hostnames (disabled — we use IPs)
+sentinel resolve-hostnames no
