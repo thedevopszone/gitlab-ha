@@ -9,14 +9,15 @@ High-availability infrastructure for GitLab, managed with Ansible.
 | etcd       | `etcd`           | 3-node distributed key-value store (DCS)         |
 | PostgreSQL | `patroni`        | 3-node PostgreSQL 16 cluster managed by Patroni  |
 | Redis      | `redis_sentinel` | 3-node Redis with Sentinel for automatic failover|
+| Gitaly     | `gitaly`         | 3-node Git storage backend (GitLab Omnibus)      |
 
 ## Nodes
 
-| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel |
-|----------------|---------------|:----:|:--------------------:|:----------------:|
-| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     |
-| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    |
-| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    |
+| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel | Gitaly      |
+|----------------|---------------|:----:|:--------------------:|:----------------:|:-----------:|
+| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     | x (gitaly-1)|
+| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    | x (gitaly-2)|
+| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    | x (gitaly-3)|
 
 ## Prerequisites
 
@@ -35,7 +36,8 @@ gitlab-ha/
 │       └── group_vars/
 │           ├── etcd_cluster.yml           # etcd cluster variables
 │           ├── patroni.yml               # Patroni / PostgreSQL variables
-│           └── redis.yml                 # Redis / Sentinel variables
+│           ├── redis.yml                 # Redis / Sentinel variables
+│           └── gitaly.yml                # Gitaly cluster variables
 ├── roles/
 │   ├── etcd/
 │   │   ├── defaults/main.yml
@@ -51,17 +53,24 @@ gitlab-ha/
 │   │   │   ├── patroni.yml.j2
 │   │   │   └── patroni.service.j2
 │   │   └── handlers/main.yml
-│   └── redis_sentinel/
+│   ├── redis_sentinel/
+│   │   ├── defaults/main.yml
+│   │   ├── tasks/main.yml
+│   │   ├── templates/
+│   │   │   ├── redis.conf.j2
+│   │   │   └── sentinel.conf.j2
+│   │   └── handlers/main.yml
+│   └── gitaly/
 │       ├── defaults/main.yml
 │       ├── tasks/main.yml
 │       ├── templates/
-│       │   ├── redis.conf.j2
-│       │   └── sentinel.conf.j2
+│       │   └── gitlab.rb.j2
 │       └── handlers/main.yml
 └── playbooks/
     ├── etcd.yml
     ├── patroni.yml
-    └── redis.yml
+    ├── redis.yml
+    └── gitaly.yml
 ```
 
 ## Deployment Order
@@ -72,9 +81,10 @@ The services must be deployed in the following order because Patroni depends on 
 1. etcd       →  ansible-playbook playbooks/etcd.yml
 2. patroni    →  ansible-playbook playbooks/patroni.yml
 3. redis      →  ansible-playbook playbooks/redis.yml
+4. gitaly     →  ansible-playbook playbooks/gitaly.yml
 ```
 
-> Both playbooks use the default inventory defined in `ansible.cfg`. You can also specify it explicitly with `-i inventories/production/hosts.yml`.
+> All playbooks use the default inventory defined in `ansible.cfg`. You can also specify it explicitly with `-i inventories/production/hosts.yml`.
 
 ---
 
@@ -859,3 +869,257 @@ redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
 | Sentinel keeps failing over repeatedly | Flapping — master is unstable | Check master node health (CPU, memory, disk); increase `down-after-milliseconds` if the master is slow but functional |
 | After failover, old master doesn't rejoin as replica | Sentinel couldn't reconfigure it | Restart Redis on the old master: `systemctl restart redis-server`; Sentinel will reconfigure it |
 | `MISCONF` errors on writes | AOF/RDB save failed (disk full or permissions) | Check disk space on `/var/lib/redis`; verify `redis` user owns the data directory |
+
+---
+
+## Gitaly Cluster
+
+### Architecture
+
+| Setting                | Value                                  |
+|------------------------|----------------------------------------|
+| GitLab Omnibus version | 18.8.4-ee                              |
+| Gitaly port            | `8075`                                 |
+| Listen address         | `0.0.0.0:8075`                         |
+| Storage path           | `/var/opt/gitlab/git-data/repositories`|
+| Configuration          | `/etc/gitlab/gitlab.rb`                |
+| Auth token             | Shared across all nodes                |
+| Omnibus role           | `gitaly_role`                          |
+
+Each node runs a standalone Gitaly instance serving one named storage. The nodes are configured using the GitLab Omnibus `roles ['gitaly_role']` mechanism, which enables only Gitaly and disables all other GitLab components (PostgreSQL, Redis, nginx, Puma, Sidekiq, etc.).
+
+| Node           | Storage Name | Address              |
+|----------------|-------------|----------------------|
+| gl-prd-core-01 | `gitaly-1`  | `172.16.0.183:8075`  |
+| gl-prd-core-02 | `gitaly-2`  | `172.16.0.147:8075`  |
+| gl-prd-core-03 | `gitaly-3`  | `172.16.0.145:8075`  |
+
+> **Note:** These are independent Gitaly nodes. Praefect (Gitaly Cluster with replication) will be configured in a later step.
+
+### Deploying Gitaly
+
+> **Prerequisite:** The GitLab Omnibus APT repository does not need to be pre-configured — the role handles it automatically.
+
+```bash
+ansible-playbook playbooks/gitaly.yml
+```
+
+#### What the playbook does
+
+1. Installs prerequisites (`curl`, `gnupg`, `apt-transport-https`)
+2. Adds the official GitLab APT repository signing key and sources list
+3. Installs the `gitlab-ee` Omnibus package
+4. Deploys `/etc/gitlab/gitlab.rb` from template (per-node configuration)
+5. Runs `gitlab-ctl reconfigure` (creates the `git` user, storage directories, and starts Gitaly)
+6. Verifies storage directory ownership (`git:git`, mode `0700`)
+7. Waits for port 8075 to become available on every node
+8. Validates Gitaly is running via `gitlab-ctl status gitaly`
+
+The playbook is fully idempotent. Configuration changes trigger `gitlab-ctl reconfigure` only when `gitlab.rb` actually changes.
+
+### Checking Cluster Health
+
+#### Quick check — service status on all nodes
+
+```bash
+ansible gitaly_cluster -b -m shell -a "gitlab-ctl status gitaly"
+```
+
+Expected output when healthy:
+
+```
+gl-prd-core-01 | CHANGED | rc=0 >> run: gitaly: (pid 35799) 120s; run: log: (pid 35710) 134s
+gl-prd-core-02 | CHANGED | rc=0 >> run: gitaly: (pid 34816) 120s; run: log: (pid 34732) 134s
+gl-prd-core-03 | CHANGED | rc=0 >> run: gitaly: (pid 34767) 121s; run: log: (pid 34695) 134s
+```
+
+All three nodes should show `run: gitaly` with an active PID.
+
+#### Verify port is listening
+
+```bash
+ansible gitaly_cluster -b -m shell -a "ss -tlnp | grep 8075"
+```
+
+Expected output (one line per node):
+
+```
+gl-prd-core-01 | CHANGED | rc=0 >> LISTEN 0  4096  *:8075  *:*  users:(("gitaly",pid=...,fd=...))
+gl-prd-core-02 | CHANGED | rc=0 >> LISTEN 0  4096  *:8075  *:*  users:(("gitaly",pid=...,fd=...))
+gl-prd-core-03 | CHANGED | rc=0 >> LISTEN 0  4096  *:8075  *:*  users:(("gitaly",pid=...,fd=...))
+```
+
+#### Check all GitLab-managed services on a node
+
+```bash
+ssh gl-prd-core-01 'sudo gitlab-ctl status'
+```
+
+On a Gitaly-only node, only `gitaly` and its log process should be listed as `run`. All other services should be absent or disabled.
+
+#### Gitaly health check (from GitLab application server)
+
+Once a GitLab application server is configured to use these Gitaly nodes:
+
+```bash
+gitlab-rake gitlab:gitaly:check
+```
+
+#### Storage directory verification
+
+```bash
+ansible gitaly_cluster -b -m shell -a "ls -la /var/opt/gitlab/git-data/"
+```
+
+The `git-data` directory and its `repositories` subdirectory should be owned by `git:git` with mode `0700`.
+
+#### Gitaly logs
+
+```bash
+# Tail logs on a specific node
+ssh gl-prd-core-01 'sudo gitlab-ctl tail gitaly'
+
+# Last 50 lines
+ssh gl-prd-core-01 'sudo gitlab-ctl tail gitaly | head -50'
+
+# All nodes at once
+ansible gitaly_cluster -b -m shell -a "gitlab-ctl tail gitaly 2>&1 | tail -5"
+```
+
+### Updating Gitaly Configuration
+
+#### Changing parameters
+
+1. Edit the variables in `inventories/production/group_vars/gitaly.yml`, or modify the template directly at `roles/gitaly/templates/gitlab.rb.j2`.
+
+   Common tunables (in `group_vars/gitaly.yml`):
+
+   | Variable                 | Default                    | Description                              |
+   |--------------------------|----------------------------|------------------------------------------|
+   | `gitaly_auth_token`      | `changeme-gitaly-secret`   | Shared auth token (use vault)            |
+   | `gitaly_listen_addr`     | `0.0.0.0`                  | Listen address for Gitaly                |
+   | `gitaly_port`            | `8075`                     | Gitaly gRPC port                         |
+   | `gitaly_storage_path`    | `/var/opt/gitlab/git-data` | Parent directory for repository storage  |
+   | `gitlab_omnibus_package` | `gitlab-ee`                | Omnibus package name (`gitlab-ee` or `gitlab-ce`) |
+   | `gitlab_external_url`    | `http://gitlab.example.com`| External URL (required by Omnibus)       |
+
+2. Run the playbook:
+
+   ```bash
+   ansible-playbook playbooks/gitaly.yml
+   ```
+
+   Only nodes with changed `gitlab.rb` files will run `gitlab-ctl reconfigure` (via handlers).
+
+3. Verify the cluster is healthy after the run (see checks above).
+
+> **Note on `gitlab.rb` format (GitLab 18.x):** The template uses `gitaly['configuration']` with a Ruby hash instead of the legacy `git_data_dirs()` function, which was removed in GitLab 18.0. The storage `path` must include the `/repositories` suffix. See [GitLab migration docs](https://docs.gitlab.com/omnibus/settings/configuration.html#migrating-from-git_data_dirs) for details.
+
+#### Changing the auth token
+
+The auth token must match across all Gitaly nodes **and** the GitLab application server's `gitlab_rails['repositories_storages']` configuration.
+
+1. Update `gitaly_auth_token` in `inventories/production/group_vars/gitaly.yml`.
+2. Re-run the playbook to apply to all nodes simultaneously:
+
+   ```bash
+   ansible-playbook playbooks/gitaly.yml
+   ```
+
+3. Update the GitLab application server configuration to use the new token.
+
+#### Adding a storage name / node
+
+1. Add the new host to the `gitaly_cluster` group in `inventories/production/hosts.yml` with a unique `gitaly_node_name`.
+2. Run the playbook — it only affects nodes with changed configuration.
+3. Register the new storage on the GitLab application server.
+
+### Upgrading GitLab Omnibus (Gitaly)
+
+The role installs `gitlab-ee` via `apt` with `state: present`, which does not upgrade an already-installed package.
+
+#### Checking current version
+
+```bash
+ansible gitaly_cluster -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+```
+
+#### Rolling upgrade (recommended)
+
+Upgrade one node at a time to maintain availability. Since each node serves an independent storage, there is no leader/replica relationship to consider, but a rolling approach ensures at least some nodes remain available throughout.
+
+**Step 1 — Upgrade the first node:**
+
+```bash
+# Upgrade the package
+ansible gl-prd-core-01 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+
+# Reconfigure to apply any new defaults
+ansible gl-prd-core-01 -b -m shell -a "gitlab-ctl reconfigure"
+
+# Verify Gitaly is running
+ansible gl-prd-core-01 -b -m shell -a "gitlab-ctl status gitaly"
+
+# Verify port is listening
+ansible gl-prd-core-01 -b -m shell -a "ss -tlnp | grep 8075"
+```
+
+**Step 2 — Repeat for remaining nodes:**
+
+```bash
+# Second node
+ansible gl-prd-core-02 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+ansible gl-prd-core-02 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-core-02 -b -m shell -a "gitlab-ctl status gitaly"
+
+# Third node
+ansible gl-prd-core-03 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+ansible gl-prd-core-03 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-core-03 -b -m shell -a "gitlab-ctl status gitaly"
+```
+
+**Step 3 — Final verification:**
+
+```bash
+# Confirm all nodes are on the same version
+ansible gitaly_cluster -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+
+# Verify all nodes are healthy
+ansible gitaly_cluster -b -m shell -a "gitlab-ctl status gitaly"
+```
+
+> **Warning:** Major GitLab version upgrades (e.g. 17.x to 18.x) may introduce breaking changes to `gitlab.rb` syntax. Always review the [GitLab upgrade path](https://docs.gitlab.com/ee/update/) and test on a staging environment first. The `grafana['enable']` and `git_data_dirs()` removals in 18.0 are examples of such breaking changes.
+
+### Credentials
+
+The Gitaly auth token is stored in `inventories/production/group_vars/gitaly.yml` in plain text by default. For production use, encrypt it with Ansible Vault:
+
+```bash
+# Encrypt the group vars file
+ansible-vault encrypt inventories/production/group_vars/gitaly.yml
+
+# Run the playbook with vault
+ansible-playbook playbooks/gitaly.yml --ask-vault-pass
+```
+
+### Key File Locations (on nodes)
+
+| File                                       | Description                          |
+|--------------------------------------------|--------------------------------------|
+| `/etc/gitlab/gitlab.rb`                    | GitLab Omnibus configuration         |
+| `/etc/gitlab/gitlab-secrets.json`          | Auto-generated secrets (do not edit) |
+| `/var/opt/gitlab/git-data/`                | Git storage parent directory         |
+| `/var/opt/gitlab/git-data/repositories/`   | Repository storage path              |
+| `/var/log/gitlab/gitaly/`                  | Gitaly log directory                 |
+
+### Gitaly Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `gitlab-ctl status gitaly` shows `down` | Service crashed or was stopped | Run `gitlab-ctl start gitaly`; check logs with `gitlab-ctl tail gitaly` |
+| `ss -tlnp | grep 8075` shows nothing | Gitaly not listening | Check `gitlab-ctl status gitaly`; run `gitlab-ctl reconfigure`; verify `gitlab.rb` syntax |
+| `gitlab-ctl reconfigure` fails with "Reading unsupported config value" | Deprecated or removed setting in `gitlab.rb` | Remove the unsupported setting (e.g. `grafana['enable']` was removed in 18.x); check [GitLab deprecations](https://docs.gitlab.com/ee/update/deprecations) |
+| `gitlab-ctl reconfigure` fails with "Removed configurations found" | Using `git_data_dirs()` on GitLab 18.x | Migrate to `gitaly['configuration']` with `storage:` array; see [migration docs](https://docs.gitlab.com/omnibus/settings/configuration.html#migrating-from-git_data_dirs) |
+| `gitlab-rake gitlab:gitaly:check` fails | Auth token mismatch or network issue | Verify `gitaly_auth_token` matches between Gitaly nodes and the GitLab application server; check port 8075 connectivity |
+| Storage directory has wrong permissions | Ownership changed or `reconfigure` not run | Run `gitlab-ctl reconfigure`; verify `git:git` ownership on `/var/opt/gitlab/git-data` |
+| Package install fails with "No package matching gitlab-ee" | GitLab APT repository not configured | Re-run the playbook — it adds the repository automatically; or add manually with `curl https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.deb.sh \| bash` |

@@ -1,0 +1,6 @@
+---
+- name: Deploy Gitaly cluster
+  hosts: gitaly_cluster
+  become: true
+  roles:
+    - gitaly

@@ -1,0 +1,124 @@
+---
+# ============================================================
+# GitLab Omnibus APT Repository
+# ============================================================
+
+- name: Install prerequisites for GitLab repository
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg
+      - apt-transport-https
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Add GitLab APT signing key
+  ansible.builtin.apt_key:
+    url: "https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/gpgkey"
+    state: present
+
+- name: Add GitLab APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/ubuntu/ {{ ansible_distribution_release }} main"
+    state: present
+    filename: gitlab-{{ gitlab_omnibus_package }}
+
+# ============================================================
+# GitLab Omnibus Package
+# ============================================================
+
+- name: Ensure GitLab Omnibus package is installed
+  ansible.builtin.apt:
+    name: "{{ gitlab_omnibus_package }}"
+    state: present
+    update_cache: true
+
+# ============================================================
+# GitLab Configuration (gitlab.rb)
+# ============================================================
+# Deploy gitlab.rb BEFORE reconfigure — reconfigure creates the
+# git user, directories, and starts services based on this config.
+
+- name: Deploy gitlab.rb for Gitaly node
+  ansible.builtin.template:
+    src: gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Reconfigure gitlab
+
+# ============================================================
+# Service Management
+# ============================================================
+# gitlab-ctl reconfigure creates the git user/group, storage
+# directories, and starts Gitaly based on gitlab.rb settings.
+
+- name: Flush handlers to apply configuration
+  ansible.builtin.meta: flush_handlers
+
+# ============================================================
+# Storage Directory Permissions
+# ============================================================
+# Ensure storage path exists with correct ownership after reconfigure.
+
+- name: Ensure Gitaly storage directory permissions
+  ansible.builtin.file:
+    path: "{{ gitaly_storage_path }}"
+    state: directory
+    owner: "{{ gitlab_user }}"
+    group: "{{ gitlab_group }}"
+    mode: "0700"
+
+- name: Ensure Gitaly repositories subdirectory permissions
+  ansible.builtin.file:
+    path: "{{ gitaly_storage_path }}/repositories"
+    state: directory
+    owner: "{{ gitlab_user }}"
+    group: "{{ gitlab_group }}"
+    mode: "0700"
+
+# ============================================================
+# Verification
+# ============================================================
+
+- name: Wait for Gitaly port {{ gitaly_port }}
+  ansible.builtin.wait_for:
+    port: "{{ gitaly_port }}"
+    host: "{{ ansible_host }}"
+    delay: 5
+    timeout: 60
+
+- name: Verify Gitaly service is running
+  ansible.builtin.command:
+    cmd: gitlab-ctl status gitaly
+  changed_when: false
+  register: gitaly_status
+
+- name: Display Gitaly service status
+  ansible.builtin.debug:
+    var: gitaly_status.stdout_lines
+
+- name: Display verification commands
+  ansible.builtin.debug:
+    msg: |
+      === Gitaly Cluster Verification ===
+
+      Check Gitaly is listening on port {{ gitaly_port }}:
+        ss -tulpen | grep {{ gitaly_port }}
+
+      Check Gitaly service status:
+        gitlab-ctl status gitaly
+
+      View Gitaly logs:
+        gitlab-ctl tail gitaly
+
+      Test Gitaly health from another node (requires gitlab-rake):
+        gitlab-rake gitlab:gitaly:check
+
+      Nodes in this cluster:
+      {% for host in groups['gitaly_cluster'] %}
+        {{ hostvars[host]['gitaly_node_name'] }} => {{ hostvars[host]['ansible_host'] }}:{{ gitaly_port }}
+      {% endfor %}
+  run_once: true

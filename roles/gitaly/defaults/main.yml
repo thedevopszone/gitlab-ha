@@ -1,0 +1,14 @@
+---
+# Gitaly role defaults (overridden by group_vars/gitaly.yml)
+
+gitaly_auth_token: "changeme-gitaly-secret"
+gitaly_listen_addr: "0.0.0.0"
+gitaly_port: 8075
+gitaly_storage_path: /var/opt/gitlab/git-data
+
+gitlab_omnibus_package: gitlab-ee
+gitlab_external_url: "http://gitlab.example.com"
+
+# GitLab user/group (created by Omnibus)
+gitlab_user: git
+gitlab_group: git

@@ -1,0 +1,16 @@
+---
+# Gitaly cluster-wide settings
+
+# Auth token shared by all Gitaly nodes (change in production / use vault)
+gitaly_auth_token: "changeme-gitaly-secret"
+
+# Network
+gitaly_listen_addr: "0.0.0.0"
+gitaly_port: 8075
+
+# Storage
+gitaly_storage_path: /var/opt/gitlab/git-data
+
+# GitLab Omnibus
+gitlab_omnibus_package: gitlab-ee
+gitlab_external_url: "http://gitlab.example.com"

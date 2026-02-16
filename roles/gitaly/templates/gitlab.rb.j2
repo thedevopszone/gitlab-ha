@@ -1,0 +1,42 @@
+# {{ ansible_managed }}
+# Gitaly node configuration — {{ inventory_hostname }} ({{ ansible_host }})
+#
+# This node runs ONLY Gitaly. All other GitLab components are disabled.
+# Managed by Ansible — do not edit manually.
+# Compatible with GitLab 18.x (git_data_dirs removed in 18.0).
+
+# ============================================================
+# External URL (required by Omnibus, not used by Gitaly itself)
+# ============================================================
+external_url '{{ gitlab_external_url }}'
+
+# ============================================================
+# Gitaly role — enables Gitaly, disables all other services
+# ============================================================
+roles ['gitaly_role']
+
+# ============================================================
+# Gitaly configuration (GitLab 18.x format)
+# ============================================================
+# Each Gitaly node serves exactly one named storage.
+# The storage name matches gitaly_node_name from the inventory,
+# making it directly addressable when Praefect is added later.
+#
+# NOTE: Remote storage entries (gitaly_address) belong on the
+# GitLab application server (gitlab_rails['repositories_storages']),
+# not here on the Gitaly node.
+gitaly['configuration'] = {
+  listen_addr: '{{ gitaly_listen_addr }}:{{ gitaly_port }}',
+  auth: {
+    token: '{{ gitaly_auth_token }}',
+  },
+  logging: {
+    dir: '/var/log/gitlab/gitaly',
+  },
+  storage: [
+    {
+      name: '{{ gitaly_node_name }}',
+      path: '{{ gitaly_storage_path }}/repositories',
+    },
+  ],
+}
