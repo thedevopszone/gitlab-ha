@@ -4,20 +4,21 @@ High-availability infrastructure for GitLab, managed with Ansible.
 
 ## Components
 
-| Component  | Role             | Description                                      |
-|------------|------------------|--------------------------------------------------|
-| etcd       | `etcd`           | 3-node distributed key-value store (DCS)         |
-| PostgreSQL | `patroni`        | 3-node PostgreSQL 16 cluster managed by Patroni  |
-| Redis      | `redis_sentinel` | 3-node Redis with Sentinel for automatic failover|
-| Gitaly     | `gitaly`         | 3-node Git storage backend (GitLab Omnibus)      |
+| Component  | Role             | Description                                        |
+|------------|------------------|----------------------------------------------------|
+| etcd       | `etcd`           | 3-node distributed key-value store (DCS)           |
+| PostgreSQL | `patroni`        | 3-node PostgreSQL 16 cluster managed by Patroni    |
+| Redis      | `redis_sentinel` | 3-node Redis with Sentinel for automatic failover  |
+| Gitaly     | `gitaly`         | 3-node Git storage backend (GitLab Omnibus)        |
+| Praefect   | `praefect`       | 3-node Gitaly replication proxy with virtual storage|
 
 ## Nodes
 
-| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel | Gitaly      |
-|----------------|---------------|:----:|:--------------------:|:----------------:|:-----------:|
-| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     | x (gitaly-1)|
-| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    | x (gitaly-2)|
-| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    | x (gitaly-3)|
+| Host           | IP            | etcd | PostgreSQL / Patroni | Redis / Sentinel | Gitaly      | Praefect      |
+|----------------|---------------|:----:|:--------------------:|:----------------:|:-----------:|:-------------:|
+| gl-prd-core-01 | 172.16.0.183  |  x   |          x           |   x (master)     | x (gitaly-1)| x (praefect-1)|
+| gl-prd-core-02 | 172.16.0.147  |  x   |          x           |   x (replica)    | x (gitaly-2)| x (praefect-2)|
+| gl-prd-core-03 | 172.16.0.145  |  x   |          x           |   x (replica)    | x (gitaly-3)| x (praefect-3)|
 
 ## Prerequisites
 
@@ -37,7 +38,8 @@ gitlab-ha/
 │           ├── etcd_cluster.yml           # etcd cluster variables
 │           ├── patroni.yml               # Patroni / PostgreSQL variables
 │           ├── redis.yml                 # Redis / Sentinel variables
-│           └── gitaly.yml                # Gitaly cluster variables
+│           ├── gitaly.yml                # Gitaly cluster variables
+│           └── praefect.yml              # Praefect cluster variables
 ├── roles/
 │   ├── etcd/
 │   │   ├── defaults/main.yml
@@ -60,7 +62,13 @@ gitlab-ha/
 │   │   │   ├── redis.conf.j2
 │   │   │   └── sentinel.conf.j2
 │   │   └── handlers/main.yml
-│   └── gitaly/
+│   ├── gitaly/
+│   │   ├── defaults/main.yml
+│   │   ├── tasks/main.yml
+│   │   ├── templates/
+│   │   │   └── gitlab.rb.j2
+│   │   └── handlers/main.yml
+│   └── praefect/
 │       ├── defaults/main.yml
 │       ├── tasks/main.yml
 │       ├── templates/
@@ -70,18 +78,20 @@ gitlab-ha/
     ├── etcd.yml
     ├── patroni.yml
     ├── redis.yml
-    └── gitaly.yml
+    ├── gitaly.yml
+    └── praefect.yml
 ```
 
 ## Deployment Order
 
-The services must be deployed in the following order because Patroni depends on etcd for leader election and cluster state:
+The services must be deployed in the following order. Patroni depends on etcd, and Praefect depends on both Patroni (database) and Gitaly (storage backends):
 
 ```
 1. etcd       →  ansible-playbook playbooks/etcd.yml
 2. patroni    →  ansible-playbook playbooks/patroni.yml
 3. redis      →  ansible-playbook playbooks/redis.yml
 4. gitaly     →  ansible-playbook playbooks/gitaly.yml
+5. praefect   →  ansible-playbook playbooks/praefect.yml
 ```
 
 > All playbooks use the default inventory defined in `ansible.cfg`. You can also specify it explicitly with `-i inventories/production/hosts.yml`.
@@ -1123,3 +1133,398 @@ ansible-playbook playbooks/gitaly.yml --ask-vault-pass
 | `gitlab-rake gitlab:gitaly:check` fails | Auth token mismatch or network issue | Verify `gitaly_auth_token` matches between Gitaly nodes and the GitLab application server; check port 8075 connectivity |
 | Storage directory has wrong permissions | Ownership changed or `reconfigure` not run | Run `gitlab-ctl reconfigure`; verify `git:git` ownership on `/var/opt/gitlab/git-data` |
 | Package install fails with "No package matching gitlab-ee" | GitLab APT repository not configured | Re-run the playbook — it adds the repository automatically; or add manually with `curl https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.deb.sh \| bash` |
+
+---
+
+## Praefect Cluster
+
+### Architecture
+
+| Setting                  | Value                                    |
+|--------------------------|------------------------------------------|
+| Cluster name             | `gitlab-praefect-cluster`                |
+| Praefect port            | `2305`                                   |
+| Prometheus metrics port  | `9652`                                   |
+| Listen address           | `0.0.0.0:2305`                           |
+| Virtual storage name     | `default`                                |
+| Replication factor       | `3`                                      |
+| Database name            | `praefect_production`                    |
+| Database user            | `praefect`                               |
+| Configuration            | `/etc/gitlab/gitlab.rb`                  |
+| Auth token               | Shared across all Praefect nodes         |
+| GitLab Omnibus version   | 18.8.4-ee                                |
+
+Praefect is a transparent proxy that sits in front of Gitaly and provides replication across all three storage backends. It stores metadata in a dedicated PostgreSQL database (`praefect_production`) managed by the Patroni cluster.
+
+Each node runs **both** Gitaly and Praefect. The `gitlab.rb` template enables both services and disables everything else (PostgreSQL, Redis, nginx, Puma, Sidekiq, etc.). Unlike the standalone Gitaly role which uses `roles ['gitaly_role']`, the Praefect role manages service selection manually so that both processes can coexist.
+
+| Node           | Praefect endpoint      | Gitaly backend          |
+|----------------|------------------------|-------------------------|
+| gl-prd-core-01 | `172.16.0.183:2305`    | `gitaly-1` on `:8075`   |
+| gl-prd-core-02 | `172.16.0.147:2305`    | `gitaly-2` on `:8075`   |
+| gl-prd-core-03 | `172.16.0.145:2305`    | `gitaly-3` on `:8075`   |
+
+Clients (GitLab Rails, Workhorse) connect to any Praefect node on port 2305 instead of directly to Gitaly. Praefect then routes and replicates requests across the Gitaly backends.
+
+### Deploying Praefect
+
+> **Prerequisites:**
+> - The Patroni/PostgreSQL cluster must be running (Praefect needs a database).
+> - Gitaly must be installed on all target nodes (the Praefect role replaces `gitlab.rb` with a combined config that includes both services).
+
+```bash
+ansible-playbook -i inventories/production/hosts.yml playbooks/praefect.yml
+```
+
+#### What the playbook does
+
+1. Installs prerequisites (`curl`, `gnupg`, `apt-transport-https`)
+2. Adds the official GitLab APT repository signing key and sources list
+3. Installs the `gitlab-ee` Omnibus package (idempotent — no-op if already present)
+4. **Discovers the Patroni primary** by querying each `postgres_cluster` node's REST API (`GET /primary`)
+5. Creates the `praefect` PostgreSQL user if not present
+6. Creates the `praefect_production` database if not present
+7. Grants privileges to the `praefect` user
+8. Ensures Gitaly storage directories exist with correct ownership (`git:git`, mode `0700`)
+9. Deploys `/etc/gitlab/gitlab.rb` from the combined Gitaly+Praefect template
+10. Runs `gitlab-ctl reconfigure` (starts Praefect, runs database migrations automatically)
+11. Waits for ports 2305 (Praefect) and 8075 (Gitaly) on every node
+12. Validates both services via `gitlab-ctl status`
+
+The playbook is fully idempotent. Configuration changes trigger `gitlab-ctl reconfigure` only when `gitlab.rb` actually changes. Database creation tasks check for existence before running and execute only once across all hosts.
+
+#### First-time deployment
+
+For a fresh cluster where Gitaly was deployed previously:
+
+```bash
+# Full stack deployment from scratch
+ansible-playbook playbooks/etcd.yml
+ansible-playbook playbooks/patroni.yml
+ansible-playbook playbooks/redis.yml
+ansible-playbook playbooks/gitaly.yml
+ansible-playbook playbooks/praefect.yml
+```
+
+The Praefect playbook replaces the Gitaly-only `gitlab.rb` with a combined template. After running the Praefect playbook, there is no need to run the Gitaly playbook separately — Praefect's template includes the full Gitaly configuration.
+
+### Checking Cluster Health
+
+#### Quick check — both services running on all nodes
+
+```bash
+ansible praefect_cluster -b -m shell -a "gitlab-ctl status praefect && gitlab-ctl status gitaly"
+```
+
+Expected output when healthy:
+
+```
+gl-prd-core-01 | CHANGED | rc=0 >>
+run: praefect: (pid 42531) 180s; run: log: (pid 42425) 195s
+run: gitaly: (pid 42518) 180s; run: log: (pid 42412) 195s
+gl-prd-core-02 | CHANGED | rc=0 >>
+run: praefect: (pid 41627) 180s; run: log: (pid 41522) 195s
+run: gitaly: (pid 41614) 180s; run: log: (pid 41509) 195s
+gl-prd-core-03 | CHANGED | rc=0 >>
+run: praefect: (pid 41583) 180s; run: log: (pid 41478) 195s
+run: gitaly: (pid 41570) 180s; run: log: (pid 41465) 195s
+```
+
+All three nodes should show `run:` for both `praefect` and `gitaly`.
+
+#### Verify ports are listening
+
+```bash
+# Praefect (port 2305)
+ansible praefect_cluster -b -m shell -a "ss -tlnp | grep 2305"
+
+# Gitaly (port 8075)
+ansible praefect_cluster -b -m shell -a "ss -tlnp | grep 8075"
+```
+
+#### Praefect dial-nodes (connectivity to all Gitaly backends)
+
+This is the single most important health check. It verifies that Praefect can reach every Gitaly backend:
+
+```bash
+ssh gl-prd-core-01 'sudo praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes'
+```
+
+Expected healthy output:
+
+```
+NODE             ADDRESS                   AUTHENTICATED  REACHABLE  ERROR
+gitaly-1         tcp://172.16.0.183:8075   true           true
+gitaly-2         tcp://172.16.0.147:8075   true           true
+gitaly-3         tcp://172.16.0.145:8075   true           true
+```
+
+All nodes should show `AUTHENTICATED = true` and `REACHABLE = true`.
+
+Run across all Praefect nodes:
+
+```bash
+ansible praefect_cluster -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes"
+```
+
+#### Praefect SQL ping (database connectivity)
+
+```bash
+ssh gl-prd-core-01 'sudo praefect -config /var/opt/gitlab/praefect/config.toml sql-ping'
+```
+
+Expected output: `Successfully connected to database`
+
+#### Praefect metadata check (from GitLab application server)
+
+Once a GitLab Rails application server is configured to use Praefect:
+
+```bash
+gitlab-rake praefect:metadata:check
+```
+
+#### Gitaly health check (from GitLab application server)
+
+```bash
+gitlab-rake gitlab:gitaly:check
+```
+
+#### Check all GitLab-managed services on a node
+
+```bash
+ssh gl-prd-core-01 'sudo gitlab-ctl status'
+```
+
+On a Praefect+Gitaly node, only `praefect`, `gitaly`, and their log processes should be listed as `run`.
+
+#### Database health
+
+Verify the Praefect database exists and is accessible:
+
+```bash
+# From any Patroni node
+psql -h 172.16.0.183 -U praefect -d praefect_production -c "SELECT 1;"
+```
+
+Check Praefect migration status:
+
+```bash
+ssh gl-prd-core-01 'sudo praefect -config /var/opt/gitlab/praefect/config.toml sql-migrate-status'
+```
+
+#### Praefect logs
+
+```bash
+# Tail logs on a specific node
+ssh gl-prd-core-01 'sudo gitlab-ctl tail praefect'
+
+# Last 50 lines
+ssh gl-prd-core-01 'sudo gitlab-ctl tail praefect | head -50'
+
+# All nodes at once
+ansible praefect_cluster -b -m shell -a "gitlab-ctl tail praefect 2>&1 | tail -5"
+```
+
+#### Gitaly logs (co-located)
+
+```bash
+ssh gl-prd-core-01 'sudo gitlab-ctl tail gitaly'
+```
+
+### Updating Praefect Configuration
+
+#### Changing parameters
+
+1. Edit the variables in `inventories/production/group_vars/praefect.yml`, or modify the template directly at `roles/praefect/templates/gitlab.rb.j2`.
+
+   Common tunables (in `group_vars/praefect.yml`):
+
+   | Variable                       | Default                      | Description                              |
+   |--------------------------------|------------------------------|------------------------------------------|
+   | `praefect_auth_token`          | `changeme-praefect-secret`   | Shared Praefect auth token (use vault)   |
+   | `praefect_listen_addr`         | `0.0.0.0`                    | Listen address for Praefect              |
+   | `praefect_port`                | `2305`                       | Praefect gRPC port                       |
+   | `praefect_replication_factor`  | `3`                          | Number of replicas per repository        |
+   | `praefect_virtual_storage_name`| `default`                    | Virtual storage name                     |
+   | `praefect_db_host`             | *(first postgres node)*      | Database host (use VIP in production)    |
+   | `praefect_db_name`             | `praefect_production`        | Database name                            |
+   | `praefect_db_user`             | `praefect`                   | Database user                            |
+   | `praefect_db_password`         | `changeme-praefect-db`       | Database password (use vault)            |
+
+2. Run the playbook:
+
+   ```bash
+   ansible-playbook playbooks/praefect.yml
+   ```
+
+   Only nodes with changed `gitlab.rb` files will run `gitlab-ctl reconfigure` (via handlers).
+
+3. Verify the cluster is healthy after the run (see checks above).
+
+> **Note:** The Praefect role deploys a combined `gitlab.rb` that includes both Gitaly and Praefect configuration. Gitaly-specific variables (`gitaly_auth_token`, `gitaly_port`, `gitaly_storage_path`, `gitaly_node_name`) are inherited from the `gitaly_cluster` group vars and inventory. After deploying Praefect, use the Praefect playbook for all `gitlab.rb` changes on these nodes.
+
+#### Changing the Praefect auth token
+
+The Praefect auth token must match on all Praefect nodes **and** in the GitLab application server's Praefect connection configuration.
+
+1. Update `praefect_auth_token` in `inventories/production/group_vars/praefect.yml`.
+2. Re-run the playbook:
+
+   ```bash
+   ansible-playbook playbooks/praefect.yml
+   ```
+
+3. Update the GitLab application server configuration to use the new token.
+
+#### Changing the Gitaly auth token
+
+Since the combined `gitlab.rb` includes the Gitaly auth token in both the Gitaly and Praefect sections, update it via the Gitaly group vars:
+
+1. Update `gitaly_auth_token` in `inventories/production/group_vars/gitaly.yml`.
+2. Re-run the Praefect playbook (it picks up the Gitaly variable):
+
+   ```bash
+   ansible-playbook playbooks/praefect.yml
+   ```
+
+#### Changing the database connection
+
+To point Praefect to a different database host (e.g., a PgBouncer or VIP):
+
+1. Update `praefect_db_host` in `inventories/production/group_vars/praefect.yml`:
+
+   ```yaml
+   praefect_db_host: "10.0.0.100"  # VIP or PgBouncer address
+   ```
+
+2. Re-run the playbook.
+
+#### Adding a Gitaly backend node
+
+1. Add the new host to the `gitaly_cluster` group in `inventories/production/hosts.yml` with a unique `gitaly_node_name`.
+2. Run the Gitaly playbook for the new node to install and configure Gitaly.
+3. Re-run the Praefect playbook — the template will automatically include the new backend in the virtual storage:
+
+   ```bash
+   ansible-playbook playbooks/praefect.yml
+   ```
+
+4. Verify the new node appears in `dial-nodes` output.
+
+### Upgrading Praefect (GitLab Omnibus)
+
+The role installs `gitlab-ee` via `apt` with `state: present`, which does not upgrade an already-installed package.
+
+#### Checking current version
+
+```bash
+ansible praefect_cluster -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+```
+
+#### Rolling upgrade (recommended)
+
+Upgrade one node at a time to maintain Praefect availability. Clients that connect to the remaining Praefect nodes continue operating normally while one node is being upgraded.
+
+**Step 1 — Upgrade the first node:**
+
+```bash
+# Upgrade the package
+ansible gl-prd-core-01 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+
+# Reconfigure to apply any new defaults and run migrations
+ansible gl-prd-core-01 -b -m shell -a "gitlab-ctl reconfigure"
+
+# Verify both services are running
+ansible gl-prd-core-01 -b -m shell -a "gitlab-ctl status praefect && gitlab-ctl status gitaly"
+
+# Verify Praefect can reach all Gitaly backends
+ansible gl-prd-core-01 -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes"
+
+# Verify database connectivity
+ansible gl-prd-core-01 -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml sql-ping"
+```
+
+**Step 2 — Repeat for the remaining nodes:**
+
+```bash
+# Second node
+ansible gl-prd-core-02 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+ansible gl-prd-core-02 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-core-02 -b -m shell -a "gitlab-ctl status praefect && gitlab-ctl status gitaly"
+ansible gl-prd-core-02 -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes"
+
+# Third node
+ansible gl-prd-core-03 -b -m apt -a "name=gitlab-ee state=latest update_cache=yes"
+ansible gl-prd-core-03 -b -m shell -a "gitlab-ctl reconfigure"
+ansible gl-prd-core-03 -b -m shell -a "gitlab-ctl status praefect && gitlab-ctl status gitaly"
+ansible gl-prd-core-03 -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes"
+```
+
+**Step 3 — Final verification:**
+
+```bash
+# Confirm all nodes are on the same version
+ansible praefect_cluster -b -m shell -a "dpkg -l gitlab-ee | tail -1 | awk '{print \$3}'"
+
+# Verify all nodes healthy
+ansible praefect_cluster -b -m shell -a "gitlab-ctl status praefect && gitlab-ctl status gitaly"
+
+# Verify Praefect connectivity from all nodes
+ansible praefect_cluster -b -m shell -a \
+  "praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes"
+```
+
+> **Warning:** Major GitLab version upgrades (e.g. 17.x to 18.x) may introduce breaking changes to `gitlab.rb` syntax or Praefect configuration format. Always review the [GitLab upgrade path](https://docs.gitlab.com/ee/update/) and test on a staging environment first.
+
+### Credentials
+
+Praefect uses two sets of credentials:
+
+| Credential              | Variable                | Location                                        |
+|-------------------------|-------------------------|-------------------------------------------------|
+| Praefect auth token     | `praefect_auth_token`   | `group_vars/praefect.yml`                       |
+| Praefect DB password    | `praefect_db_password`  | `group_vars/praefect.yml`                       |
+| Gitaly auth token       | `gitaly_auth_token`     | `group_vars/gitaly.yml`                         |
+
+For production use, encrypt sensitive variables with Ansible Vault:
+
+```bash
+# Encrypt the group vars files
+ansible-vault encrypt inventories/production/group_vars/praefect.yml
+ansible-vault encrypt inventories/production/group_vars/gitaly.yml
+
+# Run the playbook with vault
+ansible-playbook playbooks/praefect.yml --ask-vault-pass
+```
+
+### Key File Locations (on nodes)
+
+| File                                       | Description                                |
+|--------------------------------------------|--------------------------------------------|
+| `/etc/gitlab/gitlab.rb`                    | Combined Gitaly + Praefect configuration   |
+| `/etc/gitlab/gitlab-secrets.json`          | Auto-generated secrets (do not edit)       |
+| `/var/opt/gitlab/praefect/config.toml`     | Generated Praefect config (from reconfigure)|
+| `/var/opt/gitlab/git-data/`                | Git storage parent directory               |
+| `/var/opt/gitlab/git-data/repositories/`   | Repository storage path                    |
+| `/var/log/gitlab/praefect/`                | Praefect log directory                     |
+| `/var/log/gitlab/gitaly/`                  | Gitaly log directory                       |
+
+### Praefect Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `gitlab-ctl status praefect` shows `down` | Service crashed or was stopped | Run `gitlab-ctl start praefect`; check logs with `gitlab-ctl tail praefect` |
+| `ss -tlnp \| grep 2305` shows nothing | Praefect not listening | Check `gitlab-ctl status praefect`; run `gitlab-ctl reconfigure`; verify `gitlab.rb` syntax |
+| `dial-nodes` shows `AUTHENTICATED = false` | Gitaly auth token mismatch | Verify `gitaly_auth_token` in `group_vars/gitaly.yml` matches across all nodes; re-run the playbook |
+| `dial-nodes` shows `REACHABLE = false` | Gitaly not running or network issue | Check `gitlab-ctl status gitaly` on the affected node; verify port 8075 connectivity |
+| `sql-ping` fails | Database unreachable or credentials wrong | Verify `praefect_db_host`, `praefect_db_user`, `praefect_db_password`; check that `praefect_production` database exists; check Patroni cluster health |
+| `gitlab-ctl reconfigure` fails | Syntax error in `gitlab.rb` or deprecated setting | Check `/etc/gitlab/gitlab.rb` for syntax issues; review [GitLab deprecations](https://docs.gitlab.com/ee/update/deprecations) |
+| Praefect starts but repositories are unavailable | Database migrations not applied | Run `praefect -config /var/opt/gitlab/praefect/config.toml sql-migrate`; then `gitlab-ctl restart praefect` |
+| `praefect:metadata:check` reports inconsistencies | Replication lag or node was down during writes | Check that all Gitaly backends are reachable via `dial-nodes`; Praefect will automatically reconcile once backends are healthy |
+| DB creation task fails with "read-only transaction" | Delegated to a Patroni replica, not the primary | Verify Patroni cluster health (`patronictl list`); ensure the REST API on port 8008 is accessible from the Ansible controller |
+| Praefect connects to wrong DB host after Patroni failover | `praefect_db_host` points to a static IP | Set `praefect_db_host` to a VIP or PgBouncer address that follows the Patroni primary; re-run the playbook |

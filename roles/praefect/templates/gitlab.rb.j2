@@ -1,0 +1,97 @@
+# {{ ansible_managed }}
+# Combined Gitaly + Praefect node — {{ inventory_hostname }} ({{ ansible_host }})
+#
+# This node runs Gitaly (git storage) and Praefect (replication proxy).
+# All other GitLab services are disabled.
+# Managed by Ansible — do not edit manually.
+# Compatible with GitLab 18.x (git_data_dirs removed in 18.0).
+
+# ============================================================
+# External URL (required by Omnibus, not used by Gitaly/Praefect)
+# ============================================================
+external_url '{{ gitlab_external_url }}'
+
+# ============================================================
+# Service selection
+# ============================================================
+# Do NOT use roles [] — we enable services individually so that
+# both Gitaly and Praefect run on the same node.
+gitaly['enable'] = true
+praefect['enable'] = true
+
+# Disable every service that is not needed on storage nodes.
+postgresql['enable'] = false
+redis['enable'] = false
+nginx['enable'] = false
+puma['enable'] = false
+sidekiq['enable'] = false
+gitlab_workhorse['enable'] = false
+gitlab_kas['enable'] = false
+alertmanager['enable'] = false
+prometheus['enable'] = false
+gitlab_exporter['enable'] = false
+gitlab_pages['enable'] = false
+registry['enable'] = false
+letsencrypt['enable'] = false
+gitlab_rails['auto_migrate'] = false
+
+# ============================================================
+# Gitaly configuration (GitLab 18.x format)
+# ============================================================
+# Each node serves exactly one named storage.  The storage name
+# matches gitaly_node_name from the inventory.
+gitaly['configuration'] = {
+  listen_addr: '{{ gitaly_listen_addr }}:{{ gitaly_port }}',
+  auth: {
+    token: '{{ gitaly_auth_token }}',
+  },
+  logging: {
+    dir: '/var/log/gitlab/gitaly',
+  },
+  storage: [
+    {
+      name: '{{ gitaly_node_name }}',
+      path: '{{ gitaly_storage_path }}/repositories',
+    },
+  ],
+}
+
+# ============================================================
+# Praefect configuration (GitLab 18.x format)
+# ============================================================
+# Praefect proxies Git traffic to the Gitaly backends listed
+# in the virtual_storage block.  All nodes are built dynamically
+# from the gitaly_cluster inventory group.
+praefect['configuration'] = {
+  listen_addr: '{{ praefect_listen_addr }}:{{ praefect_port }}',
+  prometheus_listen_addr: '{{ praefect_prometheus_listen_addr }}:{{ praefect_prometheus_port }}',
+  auth: {
+    token: '{{ praefect_auth_token }}',
+  },
+  logging: {
+    dir: '/var/log/gitlab/praefect',
+  },
+  database: {
+    host: '{{ praefect_db_host }}',
+    port: {{ praefect_db_port }},
+    user: '{{ praefect_db_user }}',
+    password: '{{ praefect_db_password }}',
+    dbname: '{{ praefect_db_name }}',
+    sslmode: '{{ praefect_db_sslmode }}',
+  },
+  virtual_storage: [
+    {
+      name: '{{ praefect_virtual_storage_name }}',
+      default_replication_factor: {{ praefect_replication_factor }},
+      node: [
+{% for host in groups['gitaly_cluster'] %}
+        {
+          storage: '{{ hostvars[host]["gitaly_node_name"] }}',
+          address: 'tcp://{{ hostvars[host]["ansible_host"] }}:{{ gitaly_port }}',
+          token: '{{ gitaly_auth_token }}',
+        },
+{% endfor %}
+      ],
+    },
+  ],
+}

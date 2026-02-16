@@ -1,0 +1,38 @@
+---
+# Praefect role defaults
+# Override in group_vars/praefect.yml or inventory for production.
+
+# Cluster
+praefect_cluster_name: gitlab-praefect-cluster
+praefect_virtual_storage_name: default
+praefect_replication_factor: 3
+
+# Network
+praefect_listen_addr: "0.0.0.0"
+praefect_port: 2305
+praefect_prometheus_listen_addr: "0.0.0.0"
+praefect_prometheus_port: 9652
+
+# Auth
+praefect_auth_token: "changeme-praefect-secret"
+
+# Database
+praefect_db_name: praefect_production
+praefect_db_user: praefect
+praefect_db_password: "changeme-praefect-db"
+praefect_db_host: "{{ hostvars[groups['postgres_cluster'][0]]['ansible_host'] }}"
+praefect_db_port: 5432
+praefect_db_sslmode: disable
+
+# Gitaly (defaults match roles/gitaly — overridden by group_vars/gitaly.yml)
+gitaly_auth_token: "changeme-gitaly-secret"
+gitaly_listen_addr: "0.0.0.0"
+gitaly_port: 8075
+gitaly_storage_path: /var/opt/gitlab/git-data
+
+# GitLab Omnibus
+gitlab_omnibus_package: gitlab-ee
+gitlab_external_url: "http://gitlab.example.com"
+
+# Patroni REST API (used to discover the primary for DB setup)
+patroni_rest_api_port: 8008

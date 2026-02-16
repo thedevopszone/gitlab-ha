@@ -1,0 +1,6 @@
+---
+- name: Deploy Praefect cluster
+  hosts: praefect_cluster
+  become: true
+  roles:
+    - praefect

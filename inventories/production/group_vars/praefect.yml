@@ -1,0 +1,25 @@
+---
+# Praefect cluster-wide settings
+
+# Cluster identity
+praefect_cluster_name: gitlab-praefect-cluster
+praefect_virtual_storage_name: default
+praefect_replication_factor: 3
+
+# Network
+praefect_listen_addr: "0.0.0.0"
+praefect_port: 2305
+
+# Auth token shared by all Praefect nodes (change in production / use vault)
+praefect_auth_token: "changeme-praefect-secret"
+
+# Database — Praefect metadata store
+praefect_db_name: praefect_production
+praefect_db_user: praefect
+praefect_db_password: "changeme-praefect-db"
+praefect_db_port: 5432
+praefect_db_sslmode: disable
+
+# Patroni HA endpoint — points to Patroni primary by default.
+# Override with a VIP or PgBouncer address in production.
+praefect_db_host: "{{ hostvars[groups['postgres_cluster'][0]]['ansible_host'] }}"

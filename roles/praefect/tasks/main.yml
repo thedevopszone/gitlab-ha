@@ -1,0 +1,234 @@
+---
+# ============================================================
+# GitLab Omnibus APT Repository
+# ============================================================
+
+- name: Install prerequisites for GitLab repository
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg
+      - apt-transport-https
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Add GitLab APT signing key
+  ansible.builtin.apt_key:
+    url: "https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/gpgkey"
+    state: present
+
+- name: Add GitLab APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://packages.gitlab.com/gitlab/{{ gitlab_omnibus_package }}/ubuntu/ {{ ansible_distribution_release }} main"
+    state: present
+    filename: gitlab-{{ gitlab_omnibus_package }}
+
+# ============================================================
+# GitLab Omnibus Package
+# ============================================================
+
+- name: Ensure GitLab Omnibus package is installed
+  ansible.builtin.apt:
+    name: "{{ gitlab_omnibus_package }}"
+    state: present
+    update_cache: true
+
+# ============================================================
+# PostgreSQL — Praefect Database Preparation
+# ============================================================
+# Find the Patroni primary via REST API, then create the DB and
+# user.  All database tasks delegate to the primary and run once.
+
+- name: Query Patroni nodes to find primary
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[item]['ansible_host'] }}:{{ patroni_rest_api_port }}/primary"
+    status_code:
+      - 200
+      - 503
+    timeout: 5
+  loop: "{{ groups['postgres_cluster'] }}"
+  register: _patroni_primary_check
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: Identify Patroni primary node
+  ansible.builtin.set_fact:
+    _patroni_primary: >-
+      {{ (_patroni_primary_check.results
+          | selectattr('status', 'defined')
+          | selectattr('status', 'equalto', 200)
+          | map(attribute='item')
+          | first) }}
+  run_once: true
+
+- name: Display discovered Patroni primary
+  ansible.builtin.debug:
+    msg: "Patroni primary: {{ _patroni_primary }} ({{ hostvars[_patroni_primary]['ansible_host'] }})"
+  run_once: true
+
+- name: Check if Praefect database user exists
+  ansible.builtin.command:
+    cmd: psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ praefect_db_user }}'"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  register: _praefect_user_exists
+  changed_when: false
+
+- name: Create Praefect database user
+  ansible.builtin.command:
+    cmd: psql -c "CREATE ROLE {{ praefect_db_user }} WITH LOGIN PASSWORD '{{ praefect_db_password }}';"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  when: _praefect_user_exists.stdout | trim != "1"
+
+- name: Check if Praefect database exists
+  ansible.builtin.command:
+    cmd: psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ praefect_db_name }}'"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  register: _praefect_db_exists
+  changed_when: false
+
+- name: Create Praefect database
+  ansible.builtin.command:
+    cmd: createdb -O {{ praefect_db_user }} {{ praefect_db_name }}
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  when: _praefect_db_exists.stdout | trim != "1"
+
+- name: Grant privileges on Praefect database
+  ansible.builtin.command:
+    cmd: psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ praefect_db_name }} TO {{ praefect_db_user }};"
+  become_user: postgres
+  delegate_to: "{{ _patroni_primary }}"
+  run_once: true
+  changed_when: false
+
+# ============================================================
+# Storage Directories
+# ============================================================
+# Ensure Gitaly storage directories exist with correct ownership
+# (reconfigure creates them, but we enforce permissions explicitly).
+
+- name: Ensure Gitaly storage directory exists
+  ansible.builtin.file:
+    path: "{{ gitaly_storage_path }}"
+    state: directory
+    owner: git
+    group: git
+    mode: "0700"
+
+- name: Ensure Gitaly repositories subdirectory exists
+  ansible.builtin.file:
+    path: "{{ gitaly_storage_path }}/repositories"
+    state: directory
+    owner: git
+    group: git
+    mode: "0700"
+
+# ============================================================
+# GitLab Configuration (gitlab.rb)
+# ============================================================
+# Deploys the combined Gitaly + Praefect template, replacing
+# the Gitaly-only config.  Praefect virtual_storage nodes are
+# built dynamically from groups['gitaly_cluster'].
+
+- name: Deploy gitlab.rb for Praefect and Gitaly
+  ansible.builtin.template:
+    src: gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Reconfigure gitlab
+
+# ============================================================
+# Apply Configuration
+# ============================================================
+# Flush handlers so gitlab-ctl reconfigure runs before we verify.
+# Reconfigure also runs Praefect database migrations automatically.
+
+- name: Flush handlers to apply configuration
+  ansible.builtin.meta: flush_handlers
+
+# ============================================================
+# Verification
+# ============================================================
+
+- name: Wait for Praefect to listen on port {{ praefect_port }}
+  ansible.builtin.wait_for:
+    port: "{{ praefect_port }}"
+    host: "{{ ansible_host }}"
+    delay: 5
+    timeout: 120
+
+- name: Wait for Gitaly to listen on port {{ gitaly_port }}
+  ansible.builtin.wait_for:
+    port: "{{ gitaly_port }}"
+    host: "{{ ansible_host }}"
+    delay: 2
+    timeout: 60
+
+- name: Verify Praefect service status
+  ansible.builtin.command:
+    cmd: gitlab-ctl status praefect
+  changed_when: false
+  register: _praefect_status
+
+- name: Display Praefect service status
+  ansible.builtin.debug:
+    var: _praefect_status.stdout_lines
+
+- name: Verify Gitaly service status
+  ansible.builtin.command:
+    cmd: gitlab-ctl status gitaly
+  changed_when: false
+  register: _gitaly_status
+
+- name: Display Gitaly service status
+  ansible.builtin.debug:
+    var: _gitaly_status.stdout_lines
+
+- name: Display cluster validation commands
+  ansible.builtin.debug:
+    msg: |
+      === Praefect Cluster Verification ===
+
+      Port check (Praefect):
+        ss -tulpen | grep {{ praefect_port }}
+
+      Port check (Gitaly):
+        ss -tulpen | grep {{ gitaly_port }}
+
+      Service status:
+        gitlab-ctl status praefect
+        gitlab-ctl status gitaly
+
+      Praefect metadata check:
+        gitlab-rake praefect:metadata:check
+
+      Gitaly health check:
+        gitlab-rake gitlab:gitaly:check
+
+      Praefect dial-nodes (connectivity test):
+        praefect -config /var/opt/gitlab/praefect/config.toml dial-nodes
+
+      Praefect SQL ping:
+        praefect -config /var/opt/gitlab/praefect/config.toml sql-ping
+
+      Nodes in this cluster:
+      {% for host in groups['praefect_cluster'] %}
+        {{ hostvars[host]['praefect_node_name'] }} => {{ hostvars[host]['ansible_host'] }}:{{ praefect_port }}
+      {% endfor %}
+
+      Virtual storage "{{ praefect_virtual_storage_name }}" backends:
+      {% for host in groups['gitaly_cluster'] %}
+        {{ hostvars[host]['gitaly_node_name'] }} => {{ hostvars[host]['ansible_host'] }}:{{ gitaly_port }}
+      {% endfor %}
+  run_once: true
