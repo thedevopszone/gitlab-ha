@@ -1,0 +1,23 @@
+---
+# Patroni / PostgreSQL cluster configuration
+patroni_cluster_name: gitlab-pg-cluster
+postgresql_version: "16"
+postgresql_port: 5432
+postgresql_data_dir: /var/lib/postgresql/16/main
+postgresql_listen_addresses: "0.0.0.0"
+
+# Credentials – override in vault for production
+postgresql_superuser_password: "changeme-super"
+postgresql_replication_password: "changeme-repl"
+
+# Tuning
+postgresql_shared_buffers: "256MB"
+postgresql_max_wal_senders: 5
+postgresql_max_replication_slots: 5
+postgresql_wal_keep_size: "1GB"
+
+# Networking
+postgresql_network_cidr: "172.16.0.0/16"
+
+# etcd
+etcd_client_port: 2379

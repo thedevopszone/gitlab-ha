@@ -1,0 +1,78 @@
+# {{ ansible_managed }}
+scope: {{ patroni_scope }}
+name: {{ patroni_member_name }}
+
+restapi:
+  listen: 0.0.0.0:{{ patroni_rest_api_port }}
+  connect_address: {{ ansible_host }}:{{ patroni_rest_api_port }}
+
+etcd:
+  hosts: {{ groups['postgres_cluster'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', ':' ~ etcd_client_port) | join(',') }}
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: {{ postgresql_max_wal_senders }}
+        max_replication_slots: {{ postgresql_max_replication_slots }}
+        wal_keep_size: {{ postgresql_wal_keep_size }}
+        archive_mode: {{ postgresql_archive_mode }}
+        archive_command: "{{ postgresql_archive_command }}"
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - local all all trust
+    - host all all 127.0.0.1/32 trust
+    - host all all {{ postgresql_network_cidr }} md5
+{% for host in groups['postgres_cluster'] %}
+    - host replication {{ postgresql_replication_user }} {{ hostvars[host]['ansible_host'] }}/32 md5
+{% endfor %}
+
+  users:
+    {{ postgresql_replication_user }}:
+      password: "{{ postgresql_replication_password }}"
+      options:
+        - replication
+
+postgresql:
+  listen: {{ postgresql_listen_addresses }}:{{ postgresql_port }}
+  connect_address: {{ ansible_host }}:{{ postgresql_port }}
+  data_dir: {{ postgresql_data_dir }}
+  bin_dir: {{ postgresql_bin_dir }}
+  config_dir: {{ postgresql_data_dir }}
+  pgpass: /tmp/pgpass0
+  authentication:
+    superuser:
+      username: {{ postgresql_superuser }}
+      password: "{{ postgresql_superuser_password }}"
+    replication:
+      username: {{ postgresql_replication_user }}
+      password: "{{ postgresql_replication_password }}"
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+    shared_buffers: {{ postgresql_shared_buffers }}
+    wal_level: replica
+    hot_standby: "on"
+    max_wal_senders: {{ postgresql_max_wal_senders }}
+    max_replication_slots: {{ postgresql_max_replication_slots }}
+    wal_keep_size: {{ postgresql_wal_keep_size }}
+    archive_mode: {{ postgresql_archive_mode }}
+    archive_command: "{{ postgresql_archive_command }}"
+  pg_hba:
+    - local all all trust
+    - host all all 127.0.0.1/32 trust
+    - host all all {{ postgresql_network_cidr }} md5
+{% for host in groups['postgres_cluster'] %}
+    - host replication {{ postgresql_replication_user }} {{ hostvars[host]['ansible_host'] }}/32 md5
+{% endfor %}

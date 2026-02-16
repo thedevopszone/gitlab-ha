@@ -1,0 +1,37 @@
+---
+# Patroni cluster
+patroni_cluster_name: gitlab-pg-cluster
+patroni_scope: "{{ patroni_cluster_name }}"
+
+# PostgreSQL
+postgresql_version: "16"
+postgresql_port: 5432
+postgresql_data_dir: /var/lib/postgresql/{{ postgresql_version }}/main
+postgresql_bin_dir: /usr/lib/postgresql/{{ postgresql_version }}/bin
+postgresql_config_dir: /etc/postgresql/{{ postgresql_version }}/main
+postgresql_listen_addresses: "0.0.0.0"
+postgresql_superuser: postgres
+postgresql_superuser_password: "changeme-super"
+postgresql_replication_user: replicator
+postgresql_replication_password: "changeme-repl"
+
+# PostgreSQL tuning
+postgresql_shared_buffers: "256MB"
+postgresql_max_wal_senders: 5
+postgresql_max_replication_slots: 5
+postgresql_wal_keep_size: "1GB"
+
+# WAL archiving
+postgresql_archive_mode: "on"
+postgresql_archive_command: "cp %p /var/lib/postgresql/wal_archive/%f"
+postgresql_wal_archive_dir: /var/lib/postgresql/wal_archive
+
+# Patroni
+patroni_config_dir: /etc/patroni
+patroni_rest_api_port: 8008
+
+# etcd DCS
+etcd_client_port: 2379
+
+# Internal network for pg_hba
+postgresql_network_cidr: "172.16.0.0/16"

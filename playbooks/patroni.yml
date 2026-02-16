@@ -1,0 +1,6 @@
+---
+- name: Deploy Patroni-managed PostgreSQL cluster
+  hosts: postgres_cluster
+  become: true
+  roles:
+    - patroni

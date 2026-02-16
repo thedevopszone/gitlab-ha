@@ -1,0 +1,172 @@
+---
+# --- PostgreSQL 16 installation ---
+
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - gnupg2
+      - lsb-release
+      - apt-transport-https
+      - ca-certificates
+      - acl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Add PostgreSQL APT repository key
+  ansible.builtin.apt_key:
+    url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    state: present
+
+- name: Add PostgreSQL APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+    state: present
+    filename: pgdg
+
+- name: Install PostgreSQL {{ postgresql_version }}
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ postgresql_version }}"
+      - "postgresql-client-{{ postgresql_version }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- Patroni installation ---
+
+- name: Install Patroni and Python dependencies
+  ansible.builtin.apt:
+    name:
+      - patroni
+      - python3-etcd
+      - python3-psycopg2
+      - python3-pip
+    state: present
+
+- name: Install python-etcd via pip (ensure compatible version)
+  ansible.builtin.pip:
+    name: python-etcd
+    state: present
+    extra_args: --break-system-packages
+
+# --- Disable native PostgreSQL management ---
+
+- name: Stop PostgreSQL default service
+  ansible.builtin.systemd:
+    name: postgresql
+    state: stopped
+  changed_when: false
+
+- name: Disable PostgreSQL default service
+  ansible.builtin.systemd:
+    name: postgresql
+    enabled: false
+
+# --- Directory setup ---
+
+- name: Remove default PostgreSQL data directory if cluster not yet initialised by Patroni
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: absent
+  when: patroni_force_clean_bootstrap | default(false)
+
+- name: Ensure PostgreSQL data directory parent exists
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir | dirname }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+
+- name: Create WAL archive directory
+  ansible.builtin.file:
+    path: "{{ postgresql_wal_archive_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Create Patroni configuration directory
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+# --- Configuration ---
+
+- name: Deploy Patroni configuration file
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: "{{ patroni_config_dir }}/patroni.yml"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Restart patroni
+
+- name: Deploy Patroni systemd unit file
+  ansible.builtin.template:
+    src: patroni.service.j2
+    dest: /etc/systemd/system/patroni.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart patroni
+
+# --- Service management ---
+
+- name: Enable and start Patroni service
+  ansible.builtin.systemd:
+    name: patroni
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# --- Verification ---
+
+- name: Wait for PostgreSQL port to become available
+  ansible.builtin.wait_for:
+    port: "{{ postgresql_port }}"
+    host: "{{ ansible_host }}"
+    delay: 10
+    timeout: 120
+    state: started
+
+- name: Wait for Patroni REST API port to become available
+  ansible.builtin.wait_for:
+    port: "{{ patroni_rest_api_port }}"
+    host: "{{ ansible_host }}"
+    delay: 5
+    timeout: 60
+    state: started
+
+- name: Check Patroni cluster status
+  ansible.builtin.command:
+    cmd: patronictl -c {{ patroni_config_dir }}/patroni.yml list
+  changed_when: false
+  register: patroni_cluster_status
+  run_once: true
+
+- name: Display Patroni cluster status
+  ansible.builtin.debug:
+    var: patroni_cluster_status.stdout_lines
+  run_once: true
+
+- name: Display validation commands
+  ansible.builtin.debug:
+    msg: |
+      Cluster deployed. Verify with:
+
+        patronictl -c {{ patroni_config_dir }}/patroni.yml list
+
+        curl http://{{ ansible_host }}:{{ patroni_rest_api_port }}
+
+        psql -h <leader_ip> -U {{ postgresql_superuser }} -c "SELECT pg_is_in_recovery();"
+
+        # Check replication status on leader:
+        psql -h <leader_ip> -U {{ postgresql_superuser }} -c "SELECT * FROM pg_stat_replication;"
+  run_once: true
